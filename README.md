@@ -8,7 +8,7 @@ Two n8n workflows and a small Python service that remembers what they did. No cu
 
 ## The pipeline
 
-![The pipeline: arXiv RSS, local rerank, Gemini scoring, Discord cards, SQLite and a Telegram digest](docs/images/pipeline.png)
+![The pipeline: arXiv RSS, local rerank, Gemini scoring, Discord cards, SQLite and a Telegram digest](docs/images/pipeline.jpg)
 
 <details>
 <summary>Same thing as text</summary>
@@ -42,25 +42,6 @@ Two n8n workflows and a small Python service that remembers what they did. No cu
                           ▼
              select · top 8 · render HTML ─────────▶  Telegram
 ```
-
-</details>
-
-<details>
-<summary>Regenerating the diagram</summary>
-
-The image is rendered from [`docs/images/pipeline.html`](docs/images/pipeline.html), which uses the
-dashboard's own palette so the two stay in the same visual language. Edit the HTML, then:
-
-```bash
-chrome --headless=new --disable-gpu --hide-scrollbars \
-       --force-device-scale-factor=2 --window-size=1680,988 \
-       --default-background-color=0b0f16ff \
-       --screenshot=docs/images/pipeline.png \
-       docs/images/pipeline.html
-```
-
-Keeping the source next to the output is the point: a diagram nobody can regenerate goes stale
-the first time the workflow changes, which is exactly what happened to the one before it.
 
 </details>
 
