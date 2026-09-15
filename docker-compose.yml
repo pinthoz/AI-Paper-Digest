@@ -1,0 +1,105 @@
+# n8n and the ranker side by side.
+#
+#   docker compose up -d
+#   n8n     -> http://localhost:5678
+#   ranker  -> http://localhost:8000/health
+#
+# They talk over the compose network, so inside n8n the ranker's address is
+# http://ranker:8000 — not localhost, which inside a container means the
+# container itself. That one detail is the usual reason a first attempt at
+# this fails with ECONNREFUSED.
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # Without this the Config node fails with "access to env vars denied".
+      # n8n 2.x denies it even when the variable is unset, so set it explicitly
+      # rather than relying on the default being permissive.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # The cron is evaluated in this timezone, not the host's.
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-Europe/Lisbon}
+      - TZ=${GENERIC_TIMEZONE:-Europe/Lisbon}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - STORE_URL=http://ranker:8000
+      - RANKER_TOKEN=${RANKER_TOKEN:-}
+    volumes:
+      # Not optional. Without it, recreating the container loses the
+      # credentials and — silently, which is worse — the deduplication history,
+      # so the next run re-sends papers you have already read.
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - ranker
+
+  ranker:
+    build: ./ranker
+    container_name: ranker
+    restart: unless-stopped
+    ports:
+      # Published for curl and for eval.py from the host. Drop this line if you
+      # only ever reach it from n8n.
+      - "8000:8000"
+    environment:
+      - RANKER_TOKEN=${RANKER_TOKEN:-}
+      - RANKER_DB=/home/user/app/data/papers.db
+      - PORT=8000
+      # Only /feedback/sync needs this, and only to READ reactions. Posting
+      # the cards uses the webhook, which is a different permission entirely.
+      # Empty is fine: the endpoint answers 501 and nothing else is affected.
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+    volumes:
+      # The reading history. Losing it means losing every metric and every
+      # cluster the pipeline has accumulated.
+      #
+      # Mounted inside the app directory, not at /data, because the image runs
+      # as uid 1000 and a volume at a fresh path is created owned by root -
+      # which the process then cannot write to. Mounting over a directory the
+      # image already owns makes Docker inherit that ownership instead.
+      - ranker_data:/home/user/app/data
+    healthcheck:
+      # /health deliberately does not touch the model, so this stays fast even
+      # during a cold start.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  dashboard:
+    # Same image as the ranker, different command: the charts read the store
+    # through the same modules the service uses, so a schema change cannot
+    # leave them rendering a shape that no longer exists.
+    build: ./ranker
+    container_name: dashboard
+    restart: unless-stopped
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+    ports:
+      - "8501:8501"
+    environment:
+      - RANKER_DB=/home/user/app/data/papers.db
+    volumes:
+      # The same volume the ranker writes to. SQLite in WAL mode handles one
+      # writer and several readers without ceremony.
+      - ranker_data:/home/user/app/data
+      # Source mounted over the image copy so Streamlit hot-reloads on save.
+      # Without it every wording change costs a full rebuild, which is how a
+      # dashboard stops getting improved. The ranker service deliberately does
+      # not do this - it should run what was built and tested.
+      - ./ranker:/home/user/app:ro
+    depends_on:
+      - ranker
+
+volumes:
+  # Named explicitly. Compose otherwise prefixes volumes with the project name
+  # (ai-paper-digest_n8n_data), which silently creates an empty one and loses
+  # the credentials, the workflows and the deduplication history of anyone
+  # migrating from a plain `docker run`.
+  n8n_data:
+    name: n8n_data
+  ranker_data:
+    name: ranker_data

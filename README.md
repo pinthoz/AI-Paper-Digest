@@ -2,44 +2,65 @@
 
 An n8n pipeline that reads the daily arXiv output, scores every new paper against a written description of what I actually work on, posts the survivors as rich cards in Discord, and sends a ranked digest to Telegram before I open my laptop.
 
-Two workflows, no custom nodes, no paid services — it runs on free API tiers.
+Two n8n workflows and a small Python service that remembers what they did. No custom nodes, no paid services — it runs on free API tiers.
 
 ---
 
 ## The pipeline
 
-![The pipeline: arXiv RSS through embedding rank, Gemini scoring, Discord and Telegram](docs/images/pipeline.jpg)
+![The pipeline: arXiv RSS, local rerank, Gemini scoring, Discord cards, SQLite and a Telegram digest](docs/images/pipeline.png)
 
 <details>
 <summary>Same thing as text</summary>
 
 ```
                     ┌──────────────┐
-  cron 16:30  ─────▶│    Config    │   categories · thresholds · reader profile
+  cron 17:30  ─────▶│    Config    │   categories · thresholds · reader profile
    (Mon–Fri)        └──────┬───────┘
                            ▼
    arXiv RSS feed ──▶ parse XML ──▶ normalise ──▶ drop revisions  (~64 papers)
                                                         │
                                        ┌────────────────┘
                                        ▼
-                          embed + cosine rank  ──▶ cap 10 ──▶ dedupe on ID
-                          (one batch call, free)
-                                                                       │
+                     POST /rank  ──▶ apply ranking ──▶ cap 10 ──▶ dedupe on ID
+                  (local service, free,                                │
+                   no per-call ceiling)                                │
                           ┌────────────────────────────────────────────┘
                           ▼
                   ┌───────────────┐   one paper per iteration
-                  │ Loop Over     ├───────────────▶  Gemini  +  JSON schema
+                  │ Loop Over     ├──▶ throttle 8s ──▶ Gemini + JSON schema
                   │ Papers        │                          │
-                  └───────┬───────┘                    score ≥ 7 ?
+                  └───────┬───────┘                    score ≥ 6 ?
                           │ done                        │         │
                           │                            yes        no
                           │                             ▼         ▼
                           │                     Discord card    skip
-                          │                             └────┬────┘
+                          │                             │
+                          │                             ▼
+                          │                   POST /store ──▶ SQLite
                           │◀─────────────────────────────────┘
                           ▼
-             rank · top 8 · render HTML ─────────▶  Telegram
+             select · top 8 · render HTML ─────────▶  Telegram
 ```
+
+</details>
+
+<details>
+<summary>Regenerating the diagram</summary>
+
+The image is rendered from [`docs/images/pipeline.html`](docs/images/pipeline.html), which uses the
+dashboard's own palette so the two stay in the same visual language. Edit the HTML, then:
+
+```bash
+chrome --headless=new --disable-gpu --hide-scrollbars \
+       --force-device-scale-factor=2 --window-size=1680,988 \
+       --default-background-color=0b0f16ff \
+       --screenshot=docs/images/pipeline.png \
+       docs/images/pipeline.html
+```
+
+Keeping the source next to the output is the point: a diagram nobody can regenerate goes stale
+the first time the workflow changes, which is exactly what happened to the one before it.
 
 </details>
 
@@ -78,13 +99,13 @@ The parts that were not obvious when I built it.
 
 **The scoring rubric is anchored.** "Rate this 0–10" drifts upward on every run until everything is an 8. The system prompt defines what a 3, a 5, a 7 and a 9 mean, and explicitly says a normal day should produce a handful of 7+, not twenty.
 
-**Two-stage ranking, because the budget is a handful of model calls.** `max_papers_per_run` ships at 10. Without a cheap way to order candidates, those ten go to the ten *newest* papers — sampling, not selecting. So all ~45 candidates are embedded in one batch call and scored against the reader profile by cosine similarity; only the shortlist reaches the chat model. That is retrieve-then-rerank, with embeddings as the cheap stage.
+**Two-stage ranking, because the budget is a handful of model calls.** `max_papers_per_run` ships at 10. Without a cheap way to order candidates, those ten go to the ten *newest* papers — sampling, not selecting. So every candidate is embedded and scored against the reader profile by cosine similarity; only the shortlist reaches the chat model. That is retrieve-then-rerank, with embeddings as the cheap stage.
 
-It runs on the same Gemini key and the same free tier, inside n8n, with no service to host. [`ranker/`](ranker/) holds the same algorithm as a deployable Python service for anyone who would rather run a stronger local model — and it is where the evaluation harness lives.
+**The cheap stage runs locally, and that is not a preference.** It started as one `batchEmbedContents` call on the same Gemini key — until the store showed a run reporting `papers=60 skipped=862`. The endpoint caps a request at 100 texts, concepts are sent first because nothing can be scored without them, and everything past the ceiling kept its chronological place instead. The pre-filter was silently not running on 93% of the feed. It now calls [`ranker/`](ranker/), a small FastAPI service with no per-call ceiling, which is also where the store and the evaluation harness live.
 
 **Embeddings cannot represent negation, so the profile is split.** *"Not interested in reinforcement learning for games"* embeds close to *"interested in reinforcement learning for games"* — the content words dominate and `not` is a rounding error. Fold the whole profile into one vector and it faithfully attracts everything the reader asked to avoid. The ranker splits wants from don't-wants and subtracts, per fragment rather than per line, because one sentence often holds both.
 
-**The ranker degrades, it does not break.** The embedding call continues on error, and `Rank by Similarity` falls back to chronological order — including when the response comes back the wrong length, since misaligned vectors would make every score silently wrong. A digest of the newest is worse than a digest of the best, and far better than the silence of a failed run.
+**The ranker degrades, it does not break — and it says so.** `Rank via Service` continues on error, and `Apply Ranking` falls back to chronological order, including when the response comes back the wrong length, since misaligned vectors would make every score silently wrong. A digest of the newest is worse than a digest of the best and far better than a failed run. But the fallback also puts `⚠ ranked by recency` in the Telegram header, because the earlier version degraded *quietly* — which is how a pre-filter skipping 93% of the feed went unnoticed. The silence was the bug, not the fallback.
 
 **Shapes are validated by the schema, values by code.** A structured output parser sits on the LLM chain, so `relevance_score` arrives as a number and `topics` as an array. But the schema stops there on purpose: Gemini supports only a subset of JSON Schema and quietly ignores `enum`, `minItems` and `minimum` — while the parser still validates against them on the way back, failing responses the model was never told to constrain. That mismatch is what *"Model output doesn't fit required format"* actually means.
 
@@ -110,6 +131,24 @@ So ranges and enumerations live in the prompt and are enforced in `Merge Analysi
 
 **Telegram output is chunked on paper boundaries.** The Bot API hard-fails at 4096 characters and its HTML parse mode returns a `400` on a single unescaped `<` in a paper title. Both are handled in `Build Telegram Digest`.
 
+**The pipeline remembers, and that is what makes it checkable.** Every paper a run touches — posted *and* rejected — goes to a small FastAPI service backed by SQLite, along with the embedding that ranked it. The rejects are the point: the store exists to answer *was the cheap ranker right?*, and that question needs both halves of the decision.
+
+Three things become answerable once the data is there, and none of them are answerable without it:
+
+| | |
+| --- | --- |
+| `GET /metrics` | Spearman and recall@k between the cosine score and the LLM score. Is the pre-filter carrying signal, or is it an expensive shuffle? |
+| `GET /similar/:id` | Nearest neighbours by meaning — the same group reposting under a new number, or two teams landing the same idea in one week. The arXiv ID cannot catch either. |
+| `GET /clusters` | UMAP → HDBSCAN → c-TF-IDF over the stored embeddings. The workflow's tags answer *which of my interests is this?*; this answers *what is the field doing?*, and is allowed to disagree. |
+
+**SQLite, not Postgres.** Ten papers a day is a few thousand a year, and a brute-force cosine over a few thousand 768-dimension vectors is milliseconds in numpy. pgvector would be a server to maintain in exchange for nothing at this scale. Every statement lives in one module, so changing that later is one file rather than a project.
+
+**Reduce before clustering.** HDBSCAN degrades in high dimensions: as dimensionality grows the distances between all pairs converge and a density-based method has no density left to find. Projecting 768 dimensions to about 5 with UMAP restores the contrast. Skipping that step is the usual reason someone reports "HDBSCAN found one giant cluster and a lot of noise".
+
+**Reactions close the loop.** A tap on a Discord card is the cheapest feedback that exists — the reader is already looking at it. Making that work needed one non-obvious thing: a webhook returns an empty `204` unless the URL carries `?wait=true`, and without the message id that comes back there is no way to find the card again. There is no endpoint that lists a webhook's own messages.
+
+Reading those reactions needs a **bot** token rather than the webhook, because on Discord writing and reading are separate permissions. The workflow stays webhook-only; one endpoint on the service needs more.
+
 **Failures are loud.** A second workflow is registered as the Error Workflow and sends the failing node, the message and a deep link to the execution. A scheduled workflow that quietly stopped working three weeks ago is worse than no workflow at all.
 
 ---
@@ -120,11 +159,15 @@ So ranges and enumerations live in the prompt and are enforced in `Merge Analysi
 workflows/
   ai-paper-digest.json     the pipeline — import this
   error-handler.json       failure alerts — import this too
-ranker/                    the same ranking as a standalone service (optional)
+ranker/                    the memory, and an optional local ranker
+  store.py                 SQLite: papers, analyses, embeddings, feedback
+  clustering.py            UMAP → HDBSCAN → c-TF-IDF topic discovery
+  discord.py               reading reactions back off the cards
   ranker.py                profile splitting, negation handling, scoring
-  app.py                   FastAPI: /rank, /warm, /health
   eval.py                  does the cheap ranker agree with the expensive one?
-  tests/                   24 tests, no model loaded
+  app.py                   FastAPI, the whole HTTP surface
+  tests/                   91 tests, no model and no network
+docker-compose.yml         n8n and the service side by side
 docs/
   setup.md                 credentials, webhook, first run
   architecture.md          node-by-node walkthrough and data shapes
@@ -136,8 +179,9 @@ docs/
 
 - n8n **1.62 or newer** — earlier versions do not have the cross-execution mode of `Remove Duplicates`, which the deduplication depends on. Self-hosted or Cloud both work; [docs/setup.md](docs/setup.md#where-to-run-n8n) covers the trade-off, which comes down to whether the machine is awake when the schedule fires
 - A Google AI Studio API key — the free tier is enough (or any other chat model node; see [docs/setup.md](docs/setup.md#swapping-the-model))
-- A Discord webhook URL
+- A Discord webhook URL, and optionally a bot token if you want reactions read back
 - A Telegram bot token and your chat ID
+- Docker, if you want the store — `docker compose up` brings up n8n and the service together
 
 Nothing else. The ranking stage reuses the same Gemini key, and arXiv's RSS feed needs no credentials — the workflow just identifies itself with a `User-Agent`, as arXiv asks.
 
@@ -145,9 +189,13 @@ Nothing else. The ranking stage reuses the same Gemini key, and arXiv's RSS feed
 
 ```bash
 git clone <this repo>
+cp .env.example .env     # fill in the webhook and chat id
+docker compose up -d --build
 ```
 
-Import both files under **Workflows → Import from File**, then follow [docs/setup.md](docs/setup.md). About ten minutes.
+Then import both workflow files under **Workflows → Import from File** and follow [docs/setup.md](docs/setup.md). About ten minutes, most of it spent creating credentials.
+
+The service is optional. Leave `STORE_URL` empty and the pipeline runs exactly as it did before it existed — it loses the memory, never the digest.
 
 ## Running cost
 
@@ -163,8 +211,10 @@ If volume ever becomes the problem, raise `relevance_threshold` or narrow `arxiv
 
 - **Abstracts only.** The model never sees the full text, and the prompt forbids it from inventing what it cannot see. `Results` will often read *"Not stated in the abstract."* — that is the design working, not a bug.
 - **`published` is the announcement date, not the submission date.** RSS stamps every item in a feed with the same timestamp, so papers cannot be ordered by recency within a day. Nothing downstream needs that ordering — the ranker sorts by relevance — but it is why there is no date-window filter any more.
-- **Discord is a log, not a database.** You cannot sort a channel by relevance, filter to unread, or mark a paper as read. Ranking is what the Telegram digest is for. If that stops being enough, the fix is to add a store rather than to fight Discord — the workflow already produces the structured record one would need.
-- **No feedback loop.** Nothing learns from which papers I actually open. Reactions on the Discord cards would be the cheapest signal to collect, and would need Bot auth to read back.
+- **Discord is still a log, not a database.** You cannot sort a channel by relevance or filter to unread. That was the argument for adding a store rather than fighting Discord — the structured record now lives in SQLite, but nothing renders it; the queries are HTTP endpoints, not a UI.
+- **The feedback loop exists but is unproven.** Reactions are collected and joined to the scores; whether the LLM's judgement actually predicts what I open is a question the data has not answered yet. `GET /metrics` refuses to report on fewer than twenty scored papers rather than showing a correlation computed over five, which would be worse than showing nothing.
+- **Clustering needs volume.** A few hundred papers before the topics mean anything. Below that HDBSCAN correctly reports that it found nothing, which is the right answer and an unsatisfying one.
+- **Abstracts only, still.** The store makes a deeper second pass on the top-scoring paper straightforward — fetch the HTML, re-analyse — but that is not built.
 
 ## License
 

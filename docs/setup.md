@@ -25,12 +25,15 @@ This is the first decision, because it settles two things everything else depend
 docker run -d --name n8n -p 5678:5678 `
   -v n8n_data:/home/node/.n8n `
   -e GENERIC_TIMEZONE=Europe/Lisbon -e TZ=Europe/Lisbon `
+  -e N8N_BLOCK_ENV_ACCESS_IN_NODE=false `
   -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..." `
   -e TELEGRAM_CHAT_ID="123456789" `
   docker.n8n.io/n8nio/n8n
 ```
 
 Then open <http://localhost:5678>.
+
+**`N8N_BLOCK_ENV_ACCESS_IN_NODE=false` is not optional either.** Without it the `Config` node fails with *access to env vars denied* — on n8n 2.x, self-hosted, with the variable unset. Do not rely on the default being permissive; set it and move on.
 
 **The `-v n8n_data:` volume is not optional.** Without it, recreating the container loses your credentials and — worse, because it is silent — the deduplication history, so the next run re-sends papers you have already read.
 
@@ -154,7 +157,7 @@ Then wire them together. Open **AI Paper Digest → ⋯ (top right) → Settings
 
 If the dropdown is empty, the error handler was imported but never saved: open it and hit **Save** once.
 
-Set the timezone in the same panel if you are not in `Europe/Lisbon`. The cron expression `30 16 * * 1-5` is evaluated in the workflow's timezone, not the server's.
+Set the timezone in the same panel if you are not in `Europe/Lisbon`. The cron expression `30 17 * * 1-5` is evaluated in the workflow's timezone, not the server's.
 
 ---
 
@@ -204,7 +207,7 @@ Three things worth checking on that first run:
 - **The Discord cards render as embeds**, with a coloured stripe and named fields — not as a wall of plain text. Plain text means the embed JSON did not reach the node; check `Build Paper Embed`'s output for `embed_json`.
 - **The Telegram message renders formatting.** Raw `<b>` tags mean `parse_mode` did not survive the import; re-select `HTML` in the node's additional fields.
 
-Once it looks right, **Activate** the workflow. The schedule takes over from the next weekday at 16:30.
+Once it looks right, **Activate** the workflow. The schedule takes over from the next weekday at 17:30.
 
 ---
 
@@ -238,8 +241,10 @@ Two caveats if you go local: a model that cannot reliably emit JSON will hit the
 | `Model output doesn't fit required format` | Read the raw model output in the failed node. **If the JSON stops mid-string, it is truncation** — raise `maxOutputTokens` on the model node; a thinking model spends that budget on reasoning before it writes anything. If the JSON is complete but a value is out of range, someone tightened the schema: it ships with types only, and value constraints belong in `Merge Analysis`. The `"output"` wrapper around the JSON is n8n's own convention and is correct. |
 | Retries seem not to wait as long as documented | They do not. n8n caps **Wait Between Tries at 5000ms**, whatever the JSON says. Real spacing comes from the `Throttle (free tier)` node, not from the retry. |
 | `429` / `RESOURCE_EXHAUSTED` from Gemini | Too many requests. First lower `max_papers_per_run`, which is the direct control; then raise `llm_throttle_seconds` if the failures come in bursts within a single run. Repeated 429s on the very first call of a run means the *daily* cap is spent, and only waiting or a paid key fixes that. |
-| `access to env vars denied` in `Config` | Your instance blocks `$env` in expressions. See step 6 — paste the two values literally and switch those fields to **Fixed**. |
-| `ranked_by: recency` in the output | The embedding call did not succeed, or returned the wrong number of vectors. The run continues on chronological order; check the `Embed with Gemini` node output for the reason. |
-| `Embed with Gemini` returns `401`/`403` | The credential is not attached, or your n8n version does not support that credential for a generic HTTP call. Switch the node to **Generic Credential Type → Header Auth** with header `x-goog-api-key` and your key. |
+| `access to env vars denied` in `Config` | Self-hosted: set `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` on the container and recreate it. n8n 2.x denies env access even with the variable unset, so setting it explicitly is the fix. n8n Cloud: you cannot change it — paste the two values literally instead, per step 6. |
+| `⚠ ranked by recency` in the digest header | The rank call did not succeed, or returned the wrong number of scores. The run continues on chronological order rather than failing; open `Rank via Service` in the execution for the reason. The warning is deliberate — an earlier version degraded silently and nobody noticed the pre-filter had stopped running. |
+| `Rank via Service` returns `401` | `RANKER_TOKEN` differs between the ranker container and n8n. It is sent as the `X-Ranker-Token` header; both sides read the same variable from `.env`, so a mismatch usually means one container was not recreated after the file changed. |
+| `Rank via Service` cannot connect | Both endpoints are derived from one variable: `STORE_URL`, plus `/rank` or `/store`. From inside n8n the host is the compose service name — `http://ranker:8000` — never `localhost`, which there means the n8n container itself. An empty `STORE_URL` disables the store *and* the ranking, and the digest arrives ordered by recency. |
 | Run takes a while | Expected: `max_papers_per_run` × `llm_throttle_seconds` of deliberate waiting, plus the calls. It runs on a schedule and nobody is waiting on it. |
 | Digest arrives empty most days | `relevance_threshold` is too high for the number of papers the model sees, or `research_profile` does not describe your actual work. Open `Merge Analysis` in a finished execution and read `relevance_reason` — it says in one sentence why each paper scored what it did, which settles the question immediately. |
+| Dashboard raises `AttributeError` on something you just added to `theme.py` | Streamlit re-runs `dashboard.py` on every save but keeps already-imported local modules in `sys.modules`, so the page runs new chart code against the old `Theme`. Testing it with `docker compose exec dashboard python …` will not reproduce it — a fresh interpreter imports the current file. Run `docker compose restart dashboard`. Editing `dashboard.py` alone never needs this. |

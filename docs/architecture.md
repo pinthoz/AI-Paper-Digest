@@ -8,9 +8,9 @@ The workflow is one graph in four stages: **ingest → analyse → store → del
 
 ## 1 · Ingest
 
-### `Schedule 16:30 (Mon-Fri)` / `Run Manually`
+### `Schedule 17:30 (Mon-Fri)` / `Run Manually`
 
-`30 16 * * 1-5`, evaluated in the workflow timezone — not the server's, which is why `GENERIC_TIMEZONE` is set on the container as well. The arXiv RSS feed is rebuilt around 04:00 UTC each weekday, so any run after that sees a complete batch; the hour itself is just when you want to read it. The Manual Trigger shares the same downstream path, so a test run and a scheduled run are the same code path — worth keeping, because a "test-only" branch is a branch that rots.
+`30 17 * * 1-5`, evaluated in the workflow timezone — not the server's, which is why `GENERIC_TIMEZONE` is set on the container as well. The arXiv RSS feed is rebuilt around 04:00 UTC each weekday, so any run after that sees a complete batch; the hour itself is just when you want to read it. The Manual Trigger shares the same downstream path, so a test run and a scheduled run are the same code path — worth keeping, because a "test-only" branch is a branch that rots.
 
 ### `Config`
 
@@ -90,15 +90,13 @@ arXiv announces four kinds of item, and a daily feed of 115 breaks down roughly 
 
 **`notStartsWith`, not `notEquals`.** `replace-cross` is a distinct fourth value, and an equality test against `"replace"` lets all sixteen of them through while appearing to work. That is exactly the shape of bug that survives code review and is caught only by running the parser over a real feed and printing the value counts.
 
-### `Split Profile` → `Embed with Gemini` → `Rank by Similarity`
+### `Build Rank Request` → `Rank via Service` → `Apply Ranking`
 
 The first stage of a two-stage ranking, and the reason the papers that reach the chat model are the most relevant rather than the most recent.
 
-**`Split Profile`** parses the profile into wants and don't-wants. Embeddings do not represent negation — *"not interested in reinforcement learning for games"* embeds close to *"interested in reinforcement learning for games"*, because the content words dominate — so a single profile vector would faithfully attract everything the reader asked to avoid. The halves are embedded separately and the negative one is subtracted.
+**The profile is split into wants and don't-wants.** Embeddings do not represent negation — *"not interested in reinforcement learning for games"* embeds close to *"interested in reinforcement learning for games"*, because the content words dominate — so a single profile vector would faithfully attract everything the reader asked to avoid. The halves are embedded separately and the negative one is subtracted.
 
 Classification is per fragment, not per line: *"Ships production systems; does not run large-scale pretraining"* is a want and a don't-want in one sentence.
-
-**One batch call** carries every concept and every abstract. `batchEmbedContents` caps a request at 100 texts, so concepts go first — without them nothing can be scored at all — and papers take what is left, with any overflow keeping its chronological place further down rather than disappearing.
 
 The scoring:
 
@@ -107,11 +105,19 @@ The scoring:
 
 Max rather than mean on both sides: a paper is relevant because it matches one interest strongly, not because it is vaguely near the average of all of them.
 
-**The HTTP node continues on error.** It authenticates with the same `googlePalmApi` credential as the chat model, so the key never enters the workflow JSON.
+#### Why this stage is not a Gemini call
 
-**`Rank by Similarity` is where the graceful degradation lives.** It re-sorts the papers when the response is usable, and otherwise returns them in the feed's own chronological order, stamped `ranked_by: 'recency'` so the provenance shows in the execution.
+It was, and the store is what proved it should not be. A run recorded `positive=30 negative=10 papers=60 skipped=862`.
 
-It insists the response holds *exactly* the expected number of vectors. A short response could still be sliced, but the concept and paper vectors would be misaligned and every score silently wrong — which is worse than not ranking at all. Papers that overflowed the batch keep their place at the back rather than being dropped.
+`batchEmbedContents` caps a request at 100 texts. Concepts had to go first, because nothing can be scored without them; papers took the 60 slots that were left, and the other 862 kept their chronological place further down. Read as a design that "degrades gracefully", that is defensible. Read as what it actually did, the pre-filter was not running on 93% of the feed — and the top of the digest was chronological while the header claimed it was ranked.
+
+The fix was to stop pretending a batch ceiling is a ranking policy. `Rank via Service` posts the whole candidate set to a local FastAPI endpoint that embeds in as many internal batches as it needs, so there is no ceiling to overflow. 64 real papers rank in about 24 seconds, and nothing is skipped.
+
+**`Rank via Service` continues on error**, and authenticates with a shared-secret header so the endpoint is not open to anything that can reach the port.
+
+**`Apply Ranking` is where the graceful degradation lives.** It re-sorts the papers when the response is usable, and otherwise returns them in the feed's own chronological order, stamped `ranked_by: 'recency'`.
+
+It insists the response holds *exactly* the expected number of scores. A short response could still be sliced, but the papers and the scores would be misaligned and every ordering silently wrong — which is worse than not ranking at all. The stamp is then surfaced in the Telegram header as `⚠ ranked by recency`, because the lesson of the 862 is that a fallback nobody can see is indistinguishable from a bug.
 
 The ranking is an optimisation, not a dependency: every failure path ends in a working digest.
 

@@ -33,6 +33,9 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 COPY --chown=user . .
 
-# Spaces expects 7860 unless app_port says otherwise in README.md.
+# PORT lets one image serve both homes: Hugging Face Spaces expects 7860
+# (see app_port in README.md), docker-compose maps 8000. Defaulting to 7860
+# keeps the Space working with no build argument.
+ENV PORT=7860
 EXPOSE 7860
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

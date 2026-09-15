@@ -1,0 +1,20 @@
+# The theme is declared, not detected.
+#
+# st.get_option("theme.base") reports what was configured, which is None when
+# the viewer is on "auto" - so the app rendered dark while the palette was
+# built for light. Every label came out near-black on near-black. Pinning it
+# removes the guess: the charts and the chrome are built from the same values.
+[theme]
+base = "dark"
+primaryColor = "#4d93e8"          # the series blue; also recolours sliders and links
+backgroundColor = "#0b0f16"       # must equal Theme.background
+secondaryBackgroundColor = "#121824"  # must equal Theme.raised
+textColor = "#e8ecf2"             # must equal Theme.ink
+font = "sans serif"
+
+[server]
+headless = true
+fileWatcherType = "poll"          # the source is a bind mount; inotify does not cross it
+
+[browser]
+gatherUsageStats = false

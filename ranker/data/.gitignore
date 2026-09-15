@@ -1,0 +1,4 @@
+# The database is local state, not source. Every instance builds its own.
+*.db
+*.db-wal
+*.db-shm

@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "content": "## 1b · First-stage ranking\n\nThe run can afford `max_papers_per_run` model calls - ten by default. Without this stage those ten go to the ten *newest* papers, which is sampling rather than selecting.\n\nSo every candidate that survived the revision filter - around 64 on a normal day - is embedded in **one batch call** and scored against the profile by cosine similarity. Only the shortlist reaches the chat model — retrieve-then-rerank, with embeddings as the cheap stage. Same Gemini key, same free tier, no extra service to host.\n\nThe profile is split into wants and don’t-wants and the negatives are subtracted, because embeddings do not represent negation: *not interested in RL for games* embeds close to *interested in RL for games*.\n\n**It degrades gracefully.** The call continues on error, and `Rank by Similarity` falls back to chronological order when the response is missing or the wrong length.",
+        "content": "## 1b · First-stage ranking\n\nA day across five categories is around 900 announcements. The run can afford ten model calls, so something has to choose which ten.\n\n**Rank via Service** sends every candidate to the local bi-encoder in `ranker/` and gets them back ordered by similarity to the reader profile. No batch ceiling, no API quota, no cost - and it stores each paper with the vector it just computed, which is what the clustering and the near-duplicate search need later.\n\nThis replaced an embeddings API whose request cap is 100 texts: 40 went to the profile’s own concepts, 60 papers got ranked and 862 were dropped unranked. Nothing said so - the fallback did its job and the digest looked fine.\n\n**It degrades gracefully, and says when it does.** On failure the papers keep the feed order and `ranked_by` is stamped `recency`, which travels as far as the Telegram message.",
         "height": 400,
         "width": 780,
         "color": 6
@@ -47,6 +47,22 @@
       "position": [
         2360,
         240
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 5 · Memory\n\nThe same `done` output also goes to the store: every paper the run touched, kept **and** rejected.\n\nThe rejects are the point. The store exists to answer *was the cheap ranker right?*, and that needs both halves of the decision.\n\nOptional throughout. An empty `store_url` costs the memory, never the digest.",
+        "height": 300,
+        "width": 460,
+        "color": 2
+      },
+      "id": "Note - Memory",
+      "name": "Note - Memory",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2640,
+        120
       ]
     },
     {
@@ -87,13 +103,13 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "30 16 * * 1-5"
+              "expression": "30 17 * * 1-5"
             }
           ]
         }
       },
       "id": "trg-schedule",
-      "name": "Schedule 16:30 (Mon-Fri)",
+      "name": "Schedule 17:30 (Mon-Fri)",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -166,9 +182,15 @@
               "type": "string"
             },
             {
-              "id": "cfg-embedding_model",
-              "name": "embedding_model",
-              "value": "text-embedding-004",
+              "id": "cfg-store_url",
+              "name": "store_url",
+              "value": "={{ $env.STORE_URL || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-ranker_token",
+              "name": "ranker_token",
+              "value": "={{ $env.RANKER_TOKEN || '' }}",
               "type": "string"
             },
             {
@@ -321,63 +343,62 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Splits the reader profile into wants and don't-wants, then packs every\n * concept and every abstract into one batch embedding request.\n *\n * Why the split: embeddings do not represent negation. \"Not interested in\n * reinforcement learning for games\" embeds close to \"interested in\n * reinforcement learning for games\" — the content words dominate and \"not\" is\n * a rounding error. Fold the whole profile into one vector and it faithfully\n * attracts everything the reader asked to avoid. So the halves are embedded\n * separately and the negative one is subtracted downstream.\n *\n * Classification is per fragment, not per line: \"Ships production systems;\n * does not run large-scale pretraining\" is a want and a don't-want in one\n * sentence, and the don't-want is the half that matters.\n */\nconst cfg = $('Config').first().json;\nconst papers = $input.all().map((i) => i.json);\n\nconst NEGATIVE_MARKERS = ['not interested', 'no interest', 'not relevant', 'uninterested', 'avoid', 'exclude', 'ignore'];\nconst POSITIVE_MARKERS = ['interested in', 'actively working', 'working on', 'focus', 'care about', 'looking for'];\nconst INLINE_NEGATIONS = ['does not', 'do not', \"doesn't\", \"don't\", 'rather than', 'instead of'];\n\n// Left behind once a marker is stripped: \"Not interested in: X\" -> \" in: X\".\nconst LEADING_CONNECTOR = /^\\s*(?:in|on|about|with|to|for|by)?\\s*:?\\s*/i;\nconst MARKER_RE = new RegExp('^.*(?:' + [...NEGATIVE_MARKERS, ...POSITIVE_MARKERS].join('|') + ')', 'i');\n\n// One vector for \"RAG, agents, evaluation\" is a blurred average that matches\n// none of them well. Three vectors, scored with a max, match each precisely.\nconst fragments = (text) =>\n  String(text)\n    .split(/[,;.\\n]| and (?=[a-z])/)\n    .map((p) => p.replace(/^[\\s\\t\\-–—:()]+|[\\s\\t\\-–—:()]+$/g, ''))\n    // A letter has to be present, and 3 chars is the floor: \"rag\" and \"agents\"\n    // are real entries in the vocabulary, and a longer minimum would silently\n    // drop the reader's most important interests while appearing to work.\n    .filter((p) => p.length >= 3 && /[a-z]/i.test(p));\n\nconst positive = [];\nconst negative = [];\nlet lineMode = positive;\n\nfor (const rawLine of String(cfg.research_profile ?? '').split('\\n')) {\n  const line = rawLine.trim();\n  if (!line) continue;\n\n  const lower = line.toLowerCase();\n  // A heading sets the mode for this line and the ones that continue it, so a\n  // wrapped \"Not interested in:\" list stays negative to its last item.\n  if (NEGATIVE_MARKERS.some((m) => lower.includes(m))) lineMode = negative;\n  else if (POSITIVE_MARKERS.some((m) => lower.includes(m))) lineMode = positive;\n\n  const stripped = line.replace(MARKER_RE, '');\n  const body = stripped !== line ? stripped.replace(LEADING_CONNECTOR, '') : line;\n\n  for (const fragment of fragments(body || line)) {\n    const inlineNegative = INLINE_NEGATIONS.some((neg) => fragment.toLowerCase().includes(neg));\n    (inlineNegative ? negative : lineMode).push(fragment);\n  }\n}\n\nconst uniq = (xs) => [...new Set(xs)];\nconst pos = uniq(positive);\nconst neg = uniq(negative);\n\nif (pos.length === 0 && neg.length === 0) {\n  throw new Error('research_profile produced no usable concepts - check the Config node');\n}\n\n// batchEmbedContents takes at most 100 texts. Concepts come first because\n// without them nothing can be scored at all; papers take whatever is left and\n// any overflow keeps its chronological place further down.\nconst BATCH_LIMIT = 100;\nconst budget = Math.max(0, BATCH_LIMIT - pos.length - neg.length);\nconst embedded = papers.slice(0, budget);\n\n// The title is repeated: it is the densest signal in the document, and a\n// truncated abstract loses its tail first.\nconst paperText = (p) => `${String(p.title ?? '').trim()}\\n\\n${String(p.title ?? '').trim()}. ${String(p.abstract ?? '').trim()}`;\n\nconst texts = [...pos, ...neg, ...embedded.map(paperText)];\nconst model = 'models/' + String(cfg.embedding_model ?? 'text-embedding-004');\n\nreturn [\n  {\n    json: {\n      positive: pos,\n      negative: neg,\n      counts: { positive: pos.length, negative: neg.length, papers: embedded.length, skipped: papers.length - embedded.length },\n      embedded_ids: embedded.map((p) => p.arxiv_id),\n      payload: JSON.stringify({\n        requests: texts.map((text) => ({ model, content: { parts: [{ text }] } })),\n      }),\n    },\n  },\n];\n"
+        "jsCode": "/**\n * Packs the whole candidate set for the ranking service.\n *\n * One request, every paper. The previous design sent the texts to Gemini's\n * batchEmbedContents, which caps a request at 100 - and a day across five arXiv\n * categories is around 900 announcements. Forty of those slots went to the\n * profile's own concepts, so 60 papers were ranked and 862 were dropped\n * unranked. The pipeline never said so: the ranker degraded to chronological\n * order exactly as designed, and the digest looked fine.\n *\n * The local model has no such ceiling. It embeds the profile and every abstract\n * in one pass, on CPU, for nothing.\n *\n * Optional throughout. An empty store_url means the HTTP node fails, continues\n * on error, and the run falls back to recency - the same fallback as before,\n * now the exception rather than the norm.\n */\nconst cfg = $('Config').first().json;\n\nconst papers = $input.all().map((i) => i.json);\n\nreturn [\n  {\n    json: {\n      rank_endpoint: String(cfg.store_url ?? '').replace(/\\/+$/, '') + '/rank',\n      ranker_token: cfg.ranker_token ?? '',\n      candidates: papers.length,\n      payload: JSON.stringify({\n        profile: cfg.research_profile,\n        negative_weight: cfg.ranker_negative_weight,\n        // The service stores each paper and the vector it just computed, so\n        // clustering and near-duplicate search have them without a second\n        // call and without the vectors ever crossing the network.\n        persist: true,\n        papers: papers.map((p) => ({\n          arxiv_id: p.arxiv_id,\n          title: p.title,\n          abstract: p.abstract,\n        })),\n      }),\n    },\n  },\n];\n"
       },
-      "id": "rank-split",
-      "name": "Split Profile",
+      "id": "rank-req",
+      "name": "Build Rank Request",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1160,
+        1200,
         350
-      ],
-      "notes": "Wants and dont-wants are embedded separately because embeddings cannot represent negation.",
-      "notesInFlow": true
+      ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.embedding_model }}:batchEmbedContents",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googlePalmApi",
+        "url": "={{ $json.rank_endpoint }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Ranker-Token",
+              "value": "={{ $json.ranker_token }}"
+            }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ $json.payload }}",
         "options": {
-          "timeout": 60000
+          "timeout": 120000
         }
       },
-      "id": "rank-embed",
-      "name": "Embed with Gemini",
+      "id": "rank-http",
+      "name": "Rank via Service",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1360,
+        1440,
         350
       ],
       "retryOnFail": true,
-      "maxTries": 3,
+      "maxTries": 2,
       "waitBetweenTries": 5000,
       "onError": "continueRegularOutput",
-      "credentials": {
-        "googlePalmApi": {
-          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
-          "name": "Google Gemini - AI Paper Digest"
-        }
-      },
-      "notes": "One batch call for every concept and every abstract. Free tier, same key as the chat model. On failure the run continues on chronological order.",
+      "notes": "Local bi-encoder, no batch ceiling and no API quota. 120s because a cold start loads the model. On failure the run continues on chronological order.",
       "notesInFlow": true
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Scores every paper against the profile and orders them, best first.\n *\n *   score = max cosine(paper, any positive concept)\n *         - w * max cosine(paper, any negative concept)\n *\n * Max rather than mean on both sides: a paper is relevant because it matches\n * one interest strongly, not because it is vaguely near the average of all of\n * them. The same logic makes a single strong hit against a negative concept\n * enough to sink it.\n *\n * This stage is an optimisation, not a dependency. If the embedding call\n * failed, was throttled, or answered with something unexpected, the papers\n * come back in the feed's own chronological order and the run continues. A\n * digest of the five newest is worse than a digest of the five best, and far\n * better than the silence of a failed run.\n */\nconst cfg = $('Config').first().json;\nconst papers = $('New and Cross-Lists Only').all().map((i) => i.json);\nconst meta = $('Split Profile').first().json;\n\nconst byRecency = (why) => papers.map((p) => ({ json: { ...p, ranked_by: why, rank_score: null } }));\n\nconst response = $input.first()?.json ?? {};\nconst vectors = Array.isArray(response.embeddings)\n  ? response.embeddings.map((e) => e?.values).filter(Array.isArray)\n  : null;\n\nconst expected = meta.counts.positive + meta.counts.negative + meta.counts.papers;\nif (!vectors || vectors.length !== expected) {\n  // A short or malformed response cannot be sliced safely - the concept and\n  // paper vectors would be misaligned and every score silently wrong, which is\n  // worse than not ranking at all.\n  return byRecency('recency');\n}\n\nconst norm = (v) => {\n  let sum = 0;\n  for (const x of v) sum += x * x;\n  const n = Math.sqrt(sum);\n  return n ? v.map((x) => x / n) : v;\n};\nconst dot = (a, b) => {\n  let s = 0;\n  for (let i = 0; i < a.length; i++) s += a[i] * b[i];\n  return s;\n};\n\nconst nPos = meta.counts.positive;\nconst nNeg = meta.counts.negative;\n\nconst posVecs = vectors.slice(0, nPos).map(norm);\nconst negVecs = vectors.slice(nPos, nPos + nNeg).map(norm);\nconst paperVecs = vectors.slice(nPos + nNeg).map(norm);\n\nconst weight = Number(cfg.ranker_negative_weight ?? 0.5);\n\nconst scores = new Map();\nmeta.embedded_ids.forEach((arxivId, i) => {\n  const v = paperVecs[i];\n\n  let bestPos = 0;\n  let matched = '';\n  for (let j = 0; j < posVecs.length; j++) {\n    const s = dot(v, posVecs[j]);\n    if (s > bestPos || matched === '') {\n      bestPos = s;\n      matched = meta.positive[j];\n    }\n  }\n\n  let bestNeg = 0;\n  for (const nv of negVecs) bestNeg = Math.max(bestNeg, dot(v, nv));\n\n  scores.set(arxivId, {\n    score: Number((bestPos - weight * bestNeg).toFixed(6)),\n    positive_similarity: Number(bestPos.toFixed(6)),\n    negative_similarity: Number(bestNeg.toFixed(6)),\n    matched,\n  });\n});\n\nconst ranked = papers.map((p) => {\n  const hit = scores.get(p.arxiv_id);\n  return {\n    json: {\n      ...p,\n      rank_score: hit ? hit.score : null,\n      rank_matched: hit ? hit.matched : '',\n      rank_positive: hit ? hit.positive_similarity : null,\n      rank_negative: hit ? hit.negative_similarity : null,\n      ranked_by: hit ? 'embedding' : 'recency',\n    },\n  };\n});\n\n// Papers that overflowed the batch limit keep their place at the back rather\n// than being dropped: a partial ranking must not silently lose papers.\nranked.sort((a, b) => (b.json.rank_score ?? -Infinity) - (a.json.rank_score ?? -Infinity));\n\nreturn ranked;\n"
+        "jsCode": "/**\n * Merges the service's scores back onto the papers and orders them.\n *\n * This stage is an optimisation, not a dependency. If the service is down,\n * unconfigured, or answers with something unexpected, the papers come back in\n * the feed's own order and the run continues. A digest of the newest is worse\n * than a digest of the best, and far better than the silence of a failed run.\n *\n * `ranked_by` records which of the two happened. It travels all the way to the\n * Telegram message on purpose: a silent fallback is indistinguishable from\n * success, and the first time this pipeline degraded it did so for a week\n * before anyone noticed.\n */\nconst cfg = $('Config').first().json;\nconst papers = $('New and Cross-Lists Only').all().map((i) => i.json);\n\nconst byRecency = () => papers.map((p) => ({ json: { ...p, ranked_by: 'recency', rank_score: null } }));\n\nconst response = $input.first()?.json ?? {};\nconst results = Array.isArray(response.results) ? response.results : null;\n\nif (!results || results.length === 0) {\n  return byRecency();\n}\n\nconst byId = new Map(results.map((r) => [r.arxiv_id, r]));\n\nconst ranked = papers.map((p) => {\n  const hit = byId.get(p.arxiv_id);\n  return {\n    json: {\n      ...p,\n      rank_score: hit ? hit.score : null,\n      rank_matched: hit ? hit.matched : '',\n      rank_positive: hit ? hit.positive_similarity : null,\n      rank_negative: hit ? hit.negative_similarity : null,\n      ranked_by: hit ? 'embedding' : 'recency',\n    },\n  };\n});\n\n// A paper the service did not score keeps its place at the back rather than\n// being dropped: a partial ranking must not silently lose papers.\nranked.sort((a, b) => (b.json.rank_score ?? -Infinity) - (a.json.rank_score ?? -Infinity));\n\nreturn ranked;\n"
       },
-      "id": "rank-score",
-      "name": "Rank by Similarity",
+      "id": "rank-apply",
+      "name": "Apply Ranking",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1560,
+        1680,
         350
       ]
     },
@@ -580,7 +601,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $('Config').first().json.discord_webhook_url }}",
+        "url": "={{ $('Config').first().json.discord_webhook_url }}?wait=true",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ $json.discord_payload }}",
@@ -603,7 +624,7 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * The Discord node's response replaces the item, so the paper has to be put\n * back before it returns to the loop and, from there, into the digest.\n *\n * Batch size is 1, so .first() is exact rather than a heuristic - this node\n * stops being correct the moment someone raises that batch size.\n */\nconst paper = $('Merge Analysis').first().json;\n\nreturn [\n  {\n    json: {\n      ...paper,\n      posted_to_discord: true,\n    },\n  },\n];"
+        "jsCode": "/**\n * The Discord node's response replaces the item, so the paper has to be put\n * back before it returns to the loop and, from there, into the digest.\n *\n * Batch size is 1, so .first() is exact rather than a heuristic - this node\n * stops being correct the moment someone raises that batch size.\n */\nconst paper = $('Merge Analysis').first().json;\n\n// The webhook was called with ?wait=true, so Discord returned the message it\n// created instead of an empty 204. Those two ids are the only way to find the\n// card again later and read its reactions - there is no endpoint that lists a\n// webhook's own messages.\nconst posted = $input.first()?.json ?? {};\n\nreturn [\n  {\n    json: {\n      ...paper,\n      posted_to_discord: true,\n      discord_message_id: posted.id ?? null,\n      discord_channel_id: posted.channel_id ?? null,\n    },\n  },\n];"
       },
       "id": "collect",
       "name": "Collect Result",
@@ -629,7 +650,55 @@
     },
     {
       "parameters": {
-        "jsCode": "/**\n * Renders the Telegram message.\n *\n * Fed straight from the loop's \"done\" output, which carries every paper the\n * run touched — kept and skipped alike. Selecting, ranking and capping all\n * happen here rather than in a Filter → Sort → Limit chain, for one reason:\n * on a day when nothing clears the threshold there must still be *something*\n * to render, because n8n does not execute a node with zero input items and\n * the digest would silently never be sent. A Filter cannot express that, and\n * a Filter with alwaysOutputData emits an empty item that the Sort node then\n * rejects with \"Couldn't find the field 'relevance_score'\". Doing it in code\n * removes the whole class of problem: an empty list is just an empty list.\n *\n * Telegram rejects any message over 4096 characters, so the digest is emitted\n * as one item per chunk and packed on paper boundaries — an entry is never cut\n * in half, which would also break the HTML tags around it.\n */\nconst CHUNK_LIMIT = 3500;\n\nconst cfg = $('Config').first().json;\nconst screened = $('Unseen Papers Only').all().length;\nconst threshold = Number(cfg.relevance_threshold);\n\n// Papers whose analysis failed arrive as n8n error objects with no arxiv_id\n// and no score. The upstream branch cannot filter them on a score they do not\n// have, so they are dropped here.\nconst papers = $input\n  .all()\n  .map((i) => i.json)\n  .filter((p) => p && p.arxiv_id && Number.isFinite(Number(p.relevance_score)))\n  .filter((p) => Number(p.relevance_score) >= threshold)\n  .sort((a, b) => Number(b.relevance_score) - Number(a.relevance_score))\n  .slice(0, Number(cfg.digest_size));\n\n// Telegram's HTML parse mode is strict: one unescaped \"<\" in a paper title\n// returns a 400 and the whole digest is lost.\nconst esc = (s) =>\n  String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\n// Fields are clipped before the entry is assembled, never after: truncating\n// the finished string would cut an HTML tag in half. The caps only bite when\n// a model ignores the \"max 30 words\" instruction, but a run-on tldr must not\n// be able to push a single entry past what the chunker can place.\nconst clip = (s, n) => {\n  const t = String(s ?? '').trim();\n  return t.length <= n ? t : t.slice(0, n - 1).trimEnd() + '…';\n};\n\nconst header = [\n  '<b>' + $now.toFormat('cccc d LLL') + ' - AI Paper Digest</b>',\n  '<i>' + papers.length + ' of ' + screened + ' new papers scored ' + threshold + '+ - full cards in Discord</i>',\n].join('\\n');\n\nif (papers.length === 0) {\n  return [{ json: { text: header + '\\n\\nNothing cleared the bar today.', chunk: 1, chunks: 1 } }];\n}\n\nconst entries = papers.map((p, i) => {\n  const tags = (p.topics ?? []).map((t) => '#' + t.replace(/-/g, '_')).join(' ');\n  const links = [\n    '<a href=\"' + p.abs_url + '\">abs</a>',\n    '<a href=\"' + p.pdf_url + '\">pdf</a>',\n  ];\n\n  return [\n    '<b>' + (i + 1) + '. ' + esc(clip(p.title, 180)) + '</b>  <code>' + p.relevance_score + '/10</code>',\n    esc(clip(p.tldr, 240)),\n    '<i>' + esc(clip(p.why_it_matters, 340)) + '</i>',\n    (tags ? tags + '\\n' : '') + links.join(' - ') + '  <code>' + esc(p.arxiv_id) + '</code>',\n  ].join('\\n');\n});\n\nconst chunks = [];\nlet current = header;\nfor (const entry of entries) {\n  if (current.length + entry.length + 2 > CHUNK_LIMIT) {\n    chunks.push(current);\n    current = entry;\n  } else {\n    current += '\\n\\n' + entry;\n  }\n}\nchunks.push(current);\n\nreturn chunks.map((text, i) => ({\n  json: {\n    text: chunks.length > 1 ? text + '\\n\\n<i>part ' + (i + 1) + '/' + chunks.length + '</i>' : text,\n    chunk: i + 1,\n    chunks: chunks.length,\n  },\n}));\n"
+        "jsCode": "/**\n * Packs the run's results for the store.\n *\n * Fed from the loop's \"done\" output, so it carries every paper the run\n * touched — the ones that were posted and the ones that scored too low. Both\n * matter: the store's whole purpose is to answer \"was the cheap ranker right?\",\n * and that question needs the rejects as much as the keepers.\n *\n * This branch is optional. Leave `store_url` empty in Config and the HTTP node\n * downstream fails, continues on error, and the digest goes out regardless.\n */\nconst cfg = $('Config').first().json;\n\nconst papers = $input\n  .all()\n  .map((i) => i.json)\n  // Papers whose analysis failed arrive as n8n error objects with no id.\n  .filter((p) => p && p.arxiv_id);\n\nreturn [\n  {\n    json: {\n      store_endpoint: String(cfg.store_url ?? '').replace(/\\/+$/, '') + '/papers',\n      ranker_token: cfg.ranker_token ?? '',\n      count: papers.length,\n      payload: JSON.stringify({ papers }),\n    },\n  },\n];\n"
+      },
+      "id": "store-payload",
+      "name": "Build Store Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.store_endpoint }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Ranker-Token",
+              "value": "={{ $json.ranker_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.payload }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "store-http",
+      "name": "Record in Store",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        240
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "Optional. Empty store_url, or a store that is down, costs the memory - never the digest.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Renders the Telegram message.\n *\n * Fed straight from the loop's \"done\" output, which carries every paper the\n * run touched — kept and skipped alike. Selecting, ranking and capping all\n * happen here rather than in a Filter → Sort → Limit chain, for one reason:\n * on a day when nothing clears the threshold there must still be *something*\n * to render, because n8n does not execute a node with zero input items and\n * the digest would silently never be sent. A Filter cannot express that, and\n * a Filter with alwaysOutputData emits an empty item that the Sort node then\n * rejects with \"Couldn't find the field 'relevance_score'\". Doing it in code\n * removes the whole class of problem: an empty list is just an empty list.\n *\n * Telegram rejects any message over 4096 characters, so the digest is emitted\n * as one item per chunk and packed on paper boundaries — an entry is never cut\n * in half, which would also break the HTML tags around it.\n */\nconst CHUNK_LIMIT = 3500;\n\nconst cfg = $('Config').first().json;\nconst screened = $('Unseen Papers Only').all().length;\nconst threshold = Number(cfg.relevance_threshold);\n\n// Papers whose analysis failed arrive as n8n error objects with no arxiv_id\n// and no score. The upstream branch cannot filter them on a score they do not\n// have, so they are dropped here.\nconst papers = $input\n  .all()\n  .map((i) => i.json)\n  .filter((p) => p && p.arxiv_id && Number.isFinite(Number(p.relevance_score)))\n  .filter((p) => Number(p.relevance_score) >= threshold)\n  .sort((a, b) => Number(b.relevance_score) - Number(a.relevance_score))\n  .slice(0, Number(cfg.digest_size));\n\n// Telegram's HTML parse mode is strict: one unescaped \"<\" in a paper title\n// returns a 400 and the whole digest is lost.\nconst esc = (s) =>\n  String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\n// Fields are clipped before the entry is assembled, never after: truncating\n// the finished string would cut an HTML tag in half. The caps only bite when\n// a model ignores the \"max 30 words\" instruction, but a run-on tldr must not\n// be able to push a single entry past what the chunker can place.\nconst clip = (s, n) => {\n  const t = String(s ?? '').trim();\n  return t.length <= n ? t : t.slice(0, n - 1).trimEnd() + '…';\n};\n\n// Provenance, surfaced rather than logged. When the ranking service is\n// unreachable the run still produces a perfectly plausible digest - of the\n// newest papers instead of the best ones - and nothing in the message would\n// say so. The first time this degraded it went unnoticed for a week, which\n// is the whole argument for putting one line in front of the reader.\nconst degraded = $input.all().some((i) => i.json?.ranked_by === 'recency');\n\nconst header = [\n  '<b>' + $now.toFormat('cccc d LLL') + ' - AI Paper Digest</b>',\n  '<i>' + papers.length + ' of ' + screened + ' new papers scored ' + threshold + '+ - full cards in Discord</i>',\n  degraded ? '<i>\\u26a0 ranked by recency - the ranking service did not answer</i>' : '',\n]\n  .filter(Boolean)\n  .join('\\n');\n\nif (papers.length === 0) {\n  return [{ json: { text: header + '\\n\\nNothing cleared the bar today.', chunk: 1, chunks: 1 } }];\n}\n\nconst entries = papers.map((p, i) => {\n  const tags = (p.topics ?? []).map((t) => '#' + t.replace(/-/g, '_')).join(' ');\n  const links = [\n    '<a href=\"' + p.abs_url + '\">abs</a>',\n    '<a href=\"' + p.pdf_url + '\">pdf</a>',\n  ];\n\n  return [\n    '<b>' + (i + 1) + '. ' + esc(clip(p.title, 180)) + '</b>  <code>' + p.relevance_score + '/10</code>',\n    esc(clip(p.tldr, 240)),\n    '<i>' + esc(clip(p.why_it_matters, 340)) + '</i>',\n    (tags ? tags + '\\n' : '') + links.join(' - ') + '  <code>' + esc(p.arxiv_id) + '</code>',\n  ].join('\\n');\n});\n\nconst chunks = [];\nlet current = header;\nfor (const entry of entries) {\n  if (current.length + entry.length + 2 > CHUNK_LIMIT) {\n    chunks.push(current);\n    current = entry;\n  } else {\n    current += '\\n\\n' + entry;\n  }\n}\nchunks.push(current);\n\nreturn chunks.map((text, i) => ({\n  json: {\n    text: chunks.length > 1 ? text + '\\n\\n<i>part ' + (i + 1) + '/' + chunks.length + '</i>' : text,\n    chunk: i + 1,\n    chunks: chunks.length,\n  },\n}));\n"
       },
       "id": "digest",
       "name": "Build Telegram Digest",
@@ -672,7 +741,7 @@
     }
   ],
   "connections": {
-    "Schedule 16:30 (Mon-Fri)": {
+    "Schedule 17:30 (Mon-Fri)": {
       "main": [
         [
           {
@@ -753,36 +822,36 @@
       "main": [
         [
           {
-            "node": "Split Profile",
+            "node": "Build Rank Request",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split Profile": {
+    "Build Rank Request": {
       "main": [
         [
           {
-            "node": "Embed with Gemini",
+            "node": "Rank via Service",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Embed with Gemini": {
+    "Rank via Service": {
       "main": [
         [
           {
-            "node": "Rank by Similarity",
+            "node": "Apply Ranking",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Rank by Similarity": {
+    "Apply Ranking": {
       "main": [
         [
           {
@@ -820,6 +889,11 @@
         [
           {
             "node": "Build Telegram Digest",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Store Payload",
             "type": "main",
             "index": 0
           }
@@ -962,6 +1036,17 @@
         [
           {
             "node": "Send Telegram Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Store Payload": {
+      "main": [
+        [
+          {
+            "node": "Record in Store",
             "type": "main",
             "index": 0
           }

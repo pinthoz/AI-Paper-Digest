@@ -9,8 +9,9 @@ Feed it a JSONL file with one object per paper, each holding at least
 `arxiv_id`, `score` and `relevance_score` — the n8n workflow's own output
 shape. `Collect Result` items can be exported straight from an execution.
 
-    python eval.py history.jsonl
-    python eval.py history.jsonl --k 5
+    python eval.py --db                    # the usual way, once it has been running
+    python eval.py --db --since 2026-09-01
+    python eval.py history.jsonl --k 10    # or from an exported file
 
 What the numbers mean:
 
@@ -102,11 +103,24 @@ def evaluate(rows: list[dict], k: int) -> dict[str, float]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("history", type=Path, help="JSONL with arxiv_id, score, relevance_score")
-    ap.add_argument("--k", type=int, default=5, help="shortlist size, i.e. max_papers_per_run")
+    ap.add_argument("history", type=Path, nargs="?", help="JSONL with arxiv_id, score, relevance_score")
+    ap.add_argument("--db", action="store_true", help="read from the ranker store instead of a JSONL file")
+    ap.add_argument("--since", help="ISO date; only papers analysed on or after it")
+    ap.add_argument("--k", type=int, default=10, help="shortlist size, i.e. max_papers_per_run")
     args = ap.parse_args()
 
-    rows = load(args.history)
+    if args.db:
+        # The store is the normal source once the workflow has been running:
+        # it already holds both scores for every paper, with no export step.
+        sys.path.insert(0, str(Path(__file__).parent))
+        from store import Store
+
+        with Store() as s:
+            rows = s.scored_pairs(since=args.since)
+    elif args.history:
+        rows = load(args.history)
+    else:
+        ap.error("give a JSONL file, or --db to read the store")
     if len(rows) < args.k * 2:
         sys.exit(f"only {len(rows)} usable rows; need at least {args.k * 2} for the numbers to mean anything")
 

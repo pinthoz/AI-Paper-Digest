@@ -183,6 +183,7 @@ def rank(
     encode: Encoder,
     *,
     negative_weight: float = 0.5,
+    collect: dict[str, list[float]] | None = None,
 ) -> list[Scored]:
     """Score every paper against the profile, best first.
 
@@ -193,6 +194,11 @@ def rank(
     one of the reader's interests strongly, not because it is vaguely close to
     the average of all of them. The same logic makes a single strong match
     against a negative concept enough to push a paper down.
+
+    Pass a dict as *collect* to get the paper vectors back, keyed by arXiv ID.
+    The encoder has already computed them and the caller usually wants to store
+    them: re-encoding later would pay twice, and returning them through the
+    HTTP response would put megabytes of floats on the wire for nothing.
     """
     if not papers:
         return []
@@ -200,6 +206,10 @@ def rank(
         raise ValueError("profile has no usable concepts")
 
     paper_vecs = encode([paper_text(p.title, p.abstract) for p in papers])
+
+    if collect is not None:
+        for p, v in zip(papers, paper_vecs):
+            collect[p.arxiv_id] = [float(x) for x in v]
 
     pos_vecs = encode(list(profile.positive)) if profile.positive else None
     neg_vecs = encode(list(profile.negative)) if profile.negative else None

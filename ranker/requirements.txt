@@ -1,8 +1,22 @@
 fastapi>=0.115
 uvicorn[standard]>=0.32
 pydantic>=2.9
-sentence-transformers>=3.3
 numpy>=1.26
+
+# Embedding model. Only needed if you run this service as the ranker; the n8n
+# workflow uses the Gemini embeddings API instead and does not need any of it.
+sentence-transformers>=3.3
+
+# Topic clustering. Imported lazily, so /papers, /similar and /metrics all work
+# without them installed - only /clusters needs them.
+umap-learn>=0.5
+hdbscan>=0.8
+
+# Dashboard. Runs from the same image with a different command, so the
+# service and the charts never drift apart on the store schema.
+streamlit>=1.40
+plotly>=5.24
+pandas>=2.2
 
 # dev only
 pytest>=8.3
