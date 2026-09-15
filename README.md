@@ -8,7 +8,7 @@ Two workflows, no custom nodes, no paid services — it runs on free API tiers.
 
 ## The pipeline
 
-![The pipeline: arXiv RSS through embedding rank, Gemini scoring, Discord and Telegram](docs/images/pipeline.png)
+![The pipeline: arXiv RSS through embedding rank, Gemini scoring, Discord and Telegram](docs/images/pipeline.jpg)
 
 <details>
 <summary>Same thing as text</summary>
@@ -51,13 +51,13 @@ A typical weekday: ~115 announcements, ~64 survive once revisions are dropped, t
 
 ### Discord — the archive
 
-![A paper card in Discord: coloured score stripe, TL;DR, method, results and limitations as fields](docs/images/discord-card.png)
+![A paper card in Discord: coloured score stripe, TL;DR, method, results and limitations as fields](docs/images/discord.png)
 
 One embed per paper in `#ai-papers`, colour-coded by score. Permanent and searchable: the channel *is* the archive.
 
 ### Telegram — the nudge
 
-![The daily Telegram digest: papers ranked by score with abstract and PDF links](docs/images/telegram-digest.png)
+![The daily Telegram digest: papers ranked by score with abstract and PDF links](docs/images/telegram.png)
 
 One ranked message a day, capped at eight papers, short enough to read standing up. It arrives even when nothing clears the threshold — it says `0 of N` — because silence should mean something is broken, never that the day was quiet.
 
