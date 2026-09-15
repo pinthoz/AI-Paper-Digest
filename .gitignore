@@ -1,0 +1,26 @@
+.env
+*.local.json
+
+# Scratch files where secrets tend to get parked while setting things up.
+# A Discord webhook URL is a credential: anyone holding it can post to the
+# channel, and GitHub's secret scanning does not catch it.
+links
+secrets*
+*.secret
+notes.local*
+
+# n8n exports often carry credential IDs and execution data - re-export
+# deliberately into workflows/ instead of dumping the whole instance here.
+n8n-export*.json
+.n8n/
+
+.DS_Store
+Thumbs.db
+
+# ranker service
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.jsonl

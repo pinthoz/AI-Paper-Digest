@@ -1,0 +1,984 @@
+{
+  "name": "AI Paper Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 1 · Ingestion\n\n**Schedule** fires 16:30 on weekdays. The arXiv RSS feed is rebuilt around 04:00 UTC, so anything after that sees a complete batch; the hour is simply when you want to read it. The Manual Trigger beside it exists so the pipeline can be replayed without waiting a day.\n\n**Config** is the only node anyone should need to edit. Everything downstream reads it through `$('Config')`, so thresholds, category lists and the reader profile are never buried inside another node. The Discord webhook URL and the chat ID come from `$env`, which is why this export carries no secrets.\n\n**Fetch → Parse → Normalise** turns the RSS feed into one clean item per paper. The source is `rss.arxiv.org`, not the query API: a separate service with separate rate limits, which matters on n8n Cloud where the outbound IP is shared with every other tenant.\n\n**New and Cross-Lists Only** drops `replace` announcements — revisions of papers announced earlier, and close to half of a typical feed. The RSS source exposes this; the query API did not, which is the other reason to prefer it.\n\n**Cap Papers Per Run** takes the newest `max_papers_per_run` — the free-tier budget, in papers. It sits **before** the deduplicator on purpose: everything the deduplicator sees is recorded as seen, so capping after it would mark 40 papers read that were never analysed, and they would never come back.\n\n**Unseen Papers Only** is cross-execution deduplication keyed on the arXiv ID. Cross-listed papers reappear in the feed for days; this is what stops the same paper being summarised, and paid for, twice.",
+        "height": 400,
+        "width": 1400,
+        "color": 4
+      },
+      "id": "Note - Ingestion",
+      "name": "Note - Ingestion",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -280,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 1b · First-stage ranking\n\nThe run can afford `max_papers_per_run` model calls - ten by default. Without this stage those ten go to the ten *newest* papers, which is sampling rather than selecting.\n\nSo every candidate that survived the revision filter - around 64 on a normal day - is embedded in **one batch call** and scored against the profile by cosine similarity. Only the shortlist reaches the chat model — retrieve-then-rerank, with embeddings as the cheap stage. Same Gemini key, same free tier, no extra service to host.\n\nThe profile is split into wants and don’t-wants and the negatives are subtracted, because embeddings do not represent negation: *not interested in RL for games* embeds close to *interested in RL for games*.\n\n**It degrades gracefully.** The call continues on error, and `Rank by Similarity` falls back to chronological order when the response is missing or the wrong length.",
+        "height": 400,
+        "width": 780,
+        "color": 6
+      },
+      "id": "Note - Ranker",
+      "name": "Note - Ranker",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2 · Analysis — one paper at a time\n\n**Loop Over Papers** runs with a batch size of 1. A failure on paper 34 then costs one model call rather than the whole batch, and the loop resumes where it stopped.\n\n**Throttle** is the second half of staying inside the free tier. Gemini's free plan caps requests *per minute*; eight seconds per iteration holds the pipeline at 7.5/min, comfortably under a 10/min ceiling. At the default cap of 10 papers the loop spends about 80 seconds waiting, unattended, at 07:30. Set `llm_throttle_seconds` to 0 on a paid key.\n\n**Analyse Paper** is a Basic LLM Chain with a **structured output parser** attached. The schema guarantees *shapes* — an array stays an array — while every value constraint is enforced downstream in `Merge Analysis`, because Gemini ignores half of JSON Schema but the parser still validates against it.\n\nThree retries (n8n caps the spacing at 5s, which is why the **Throttle** in front matters more than the retry here), then the **error output** sends the paper to `Skipped`. One abstract the model cannot parse must not cost the rest of the run.\n\nThe system prompt carries the reader profile and a controlled tag vocabulary. Scoring rules spell out what a 3 and a 9 mean, because \"rate this 0-10\" without anchors drifts upward every run.\n\n**Relevant Enough?** is an IF, not a Filter. Both branches feed back into the loop, so a rejected paper still closes its iteration. A Filter would drop the item and the loop would stall.",
+        "height": 700,
+        "width": 780,
+        "color": 7
+      },
+      "id": "Note - Analysis",
+      "name": "Note - Analysis",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2360,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3 · Discord — the archive\n\nOne rich embed per paper in `#ai-papers`, colour-coded by score. The channel becomes the searchable archive; Discord's own search covers it.\n\n**Build Paper Embed** enforces Discord's limits before the request leaves n8n — title 256, description 4096, field value 1024, and 6000 characters across the *whole* embed. Blow any one of them and the API returns a 400 with no usable error body, which is a miserable thing to debug at 07:31.\n\nIt also sets `allowed_mentions: { parse: [] }`. arXiv titles are not a trusted input: one containing `@everyone` would otherwise ping the whole server.\n\n**Posted with an HTTP Request node**, not the Discord node. A webhook is a plain POST with a JSON body — no auth header, no SDK — and the payload has to be built in code anyway, because the Discord node's embed UI is a fixed collection that cannot express a variable number of fields. The URL is a secret and comes from `$env`, so it never lands in this export.\n\nA webhook means no bot: no application, no token, no gateway, no server permissions. The trade is that threads and reactions need Bot auth.\n\n**Collect Result** puts the paper back on the item — the Discord response replaces it — so the digest branch still has something to rank.",
+        "height": 420,
+        "width": 740,
+        "color": 5
+      },
+      "id": "Note - Storage",
+      "name": "Note - Storage",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3080,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4 · Telegram — the daily nudge\n\nReached through the loop's **done** output, so it runs exactly once, after every paper has been filed.\n\nSelecting, ranking and capping at `digest_size` all happen inside the Code node. A Filter/Sort/Limit chain reads better on a canvas but cannot render a day when nothing clears the bar - n8n skips a node with zero input items, so the message would simply never be sent, and silence is indistinguishable from a crash.\n\n**Build Telegram Digest** escapes HTML — an unescaped `<` in a paper title returns a 400 from the Bot API — and packs entries into ≤3500-character chunks on paper boundaries, because Telegram hard-fails at 4096.",
+        "height": 380,
+        "width": 1020,
+        "color": 3
+      },
+      "id": "Note - Delivery",
+      "name": "Note - Delivery",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2360,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 16 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "trg-schedule",
+      "name": "Schedule 16:30 (Mon-Fri)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        260
+      ],
+      "notes": "The RSS feed is rebuilt around 04:00 UTC each weekday, so any run after that sees a complete batch. The exact hour is a matter of when you want to read it."
+    },
+    {
+      "parameters": {},
+      "id": "trg-manual",
+      "name": "Run Manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-arxiv_categories",
+              "name": "arxiv_categories",
+              "value": "cs.AI, cs.LG, cs.CL, cs.CV, stat.ML",
+              "type": "string"
+            },
+            {
+              "id": "cfg-relevance_threshold",
+              "name": "relevance_threshold",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "cfg-digest_size",
+              "name": "digest_size",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "cfg-digest_language",
+              "name": "digest_language",
+              "value": "English",
+              "type": "string"
+            },
+            {
+              "id": "cfg-max_papers_per_run",
+              "name": "max_papers_per_run",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "cfg-llm_throttle_seconds",
+              "name": "llm_throttle_seconds",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "cfg-research_profile",
+              "name": "research_profile",
+              "value": "Applied ML engineer and MSc researcher. Ships production systems and reads papers for things that can be implemented this month.\n\nActively working on: mechanistic interpretability of transformers, attention head analysis, head specialisation metrics, probing what BERT and GPT-2 class models encode, visualising attention, inspecting model internals.\n\nAlso working on: retrieval-augmented generation that stays grounded and cites its sources, structured LLM output, schema-constrained decoding, natural language to validated query interfaces, evaluation of LLM systems.\n\nAlso working on: explainability for tabular models, SHAP and feature attribution, embedding-based similarity search over structured data, football analytics from event data, player similarity and role classification.\n\nInterested in: small open-weight models that run locally, Gemma and Qwen and Llama class models, quantisation, efficient inference on CPU, compact embedding models, measuring bias in language models, fairness evaluation of language models, honest benchmarks with reproducible code.\n\nNot interested in: large-scale pretraining, scaling laws for frontier models, incremental leaderboard deltas, pure theory with no implementation, hardware accelerator papers, kernel level systems work, reinforcement learning for games, robotics, image generation, video generation.",
+              "type": "string"
+            },
+            {
+              "id": "cfg-topic_vocabulary",
+              "name": "topic_vocabulary",
+              "value": "interpretability, mechanistic-interpretability, attention, attention-heads, probing, transformers, bert, gpt2, model-internals, bias, fairness, alignment, safety, rag, grounding, citations, retrieval, embeddings, similarity-search, structured-output, constrained-decoding, text-to-sql, agents, tool-use, evaluation, benchmarks, llm-judge, shap, feature-attribution, explainability, tabular-ml, small-models, open-weights, quantization, distillation, inference-efficiency, long-context, reasoning, multimodal, datasets, synthetic-data, sports-analytics, football",
+              "type": "string"
+            },
+            {
+              "id": "cfg-embedding_model",
+              "name": "embedding_model",
+              "value": "text-embedding-004",
+              "type": "string"
+            },
+            {
+              "id": "cfg-ranker_negative_weight",
+              "name": "ranker_negative_weight",
+              "value": 0.5,
+              "type": "number"
+            },
+            {
+              "id": "cfg-discord_webhook_url",
+              "name": "discord_webhook_url",
+              "value": "={{ $env.DISCORD_WEBHOOK_URL || 'PASTE_DISCORD_WEBHOOK_URL' }}",
+              "type": "string"
+            },
+            {
+              "id": "cfg-telegram_chat_id",
+              "name": "telegram_chat_id",
+              "value": "={{ $env.TELEGRAM_CHAT_ID || 'PASTE_TELEGRAM_CHAT_ID' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cfg",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -20,
+        350
+      ],
+      "notes": "Single source of truth. Tune the pipeline here, nowhere else.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Builds the arXiv RSS URL.\n *\n * The RSS host takes categories joined with \"+\":\n *   \"cs.AI, cs.LG\"  ->  https://rss.arxiv.org/rss/cs.AI+cs.LG\n *\n * This is a different service from export.arxiv.org/api/query, with its own\n * rate limits — which matters on n8n Cloud, where the outbound IP is shared\n * with every other tenant and the API's per-IP throttle can be tripped by\n * traffic that is not yours.\n *\n * It is also the better source for this job: the RSS feed *is* the day's\n * announcement list, so there is no date window to get right, no paging, and\n * every item carries an announce_type the API does not expose.\n */\nconst cfg = $input.first().json;\n\nconst categories = String(cfg.arxiv_categories)\n  .split(',')\n  .map((c) => c.trim())\n  .filter(Boolean);\n\nif (categories.length === 0) {\n  throw new Error('Config.arxiv_categories is empty - there is nothing to fetch.');\n}\n\nreturn [\n  {\n    json: {\n      ...cfg,\n      rss_url: 'https://rss.arxiv.org/rss/' + categories.join('+'),\n    },\n  },\n];\n"
+      },
+      "id": "q-build",
+      "name": "Build arXiv Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        350
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.rss_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "ai-paper-digest/1.0 (n8n; personal research digest)"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "http-arxiv",
+      "name": "Fetch arXiv Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        350
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "The RSS host, not export.arxiv.org/api/query - separate service, separate rate limits, which matters on shared Cloud IPs. Still identify yourself, and pin this output while iterating rather than re-fetching."
+    },
+    {
+      "parameters": {
+        "mode": "xmlToJson",
+        "dataPropertyName": "data",
+        "options": {
+          "explicitArray": false,
+          "mergeAttrs": true,
+          "trim": true
+        }
+      },
+      "id": "xml",
+      "name": "Parse Atom Feed",
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        640,
+        350
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Flattens one arXiv RSS feed into one n8n item per paper.\n *\n * The feed is RSS 2.0 with arxiv: and dc: extensions. Two shapes need care:\n *\n *  - The XML node runs with explicitArray = false, so a feed holding a single\n *    <item> arrives as an object rather than an array. That edge case is why\n *    this is a Code node and not a Split Out node.\n *  - mergeAttrs = true folds attributes into their parent, so an element that\n *    has both attributes and text — <guid isPermaLink=\"false\">oai:…</guid> —\n *    becomes { isPermaLink: 'false', _: 'oai:…' } rather than a string.\n */\nconst channel = $input.first().json.rss?.channel ?? {};\nconst many = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);\nconst clean = (v) => String(v ?? '').replace(/\\s+/g, ' ').trim();\n// Unwrap the { _: 'text', attr: '…' } form the XML node produces for elements\n// that carry attributes alongside their text.\nconst text = (v) => clean(v && typeof v === 'object' ? v._ : v);\n\nreturn many(channel.item).map((item) => {\n  // guid: \"oai:arXiv.org:2609.11955v1\" -> id 2609.11955, version v1\n  const guid = text(item.guid);\n  const idWithVersion = guid.split(':').pop();\n  const version = idWithVersion.match(/v(\\d+)$/)?.[1];\n\n  // description: \"arXiv:2609.11955v1 Announce Type: new \\nAbstract: <body>\"\n  const description = clean(item.description);\n  const abstract = clean(description.split(/Abstract:\\s*/s).slice(1).join('Abstract: ')) || description;\n\n  const absUrl = text(item.link);\n  const authors = text(item['dc:creator'])\n    .split(/,\\s*/)\n    .map(clean)\n    .filter(Boolean);\n  const categories = many(item.category).map(text).filter(Boolean);\n\n  return {\n    json: {\n      arxiv_id: idWithVersion.replace(/v\\d+$/, ''),\n      version: version ? 'v' + version : 'v1',\n      // new: first announcement. cross: announced in another category first.\n      // replace: a revision of a paper announced earlier - usually not news.\n      announce_type: text(item['arxiv:announce_type']) || 'new',\n      title: clean(item.title),\n      abstract,\n      authors,\n      authors_line:\n        authors.length > 6 ? authors.slice(0, 6).join(', ') + ' et al.' : authors.join(', '),\n      primary_category: categories[0] ?? '',\n      categories,\n      // The RSS pubDate is the announcement date, shared by every item in the\n      // feed - not the submission date the API reports.\n      published: item.pubDate ? new Date(text(item.pubDate)).toISOString() : new Date().toISOString(),\n      updated: '',\n      abs_url: absUrl,\n      pdf_url: absUrl.replace('/abs/', '/pdf/'),\n      // Not carried by RSS; kept so the item shape matches what the prompt and\n      // the Discord card already expect.\n      comment: '',\n      journal_ref: '',\n    },\n  };\n});\n"
+      },
+      "id": "norm",
+      "name": "Normalise Papers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        350
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "not-a-revision",
+              "leftValue": "={{ $json.announce_type }}",
+              "rightValue": "replace",
+              "operator": {
+                "type": "string",
+                "operation": "notStartsWith"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "recent",
+      "name": "New and Cross-Lists Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        1060,
+        350
+      ],
+      "notes": "Drops announce_type replace AND replace-cross - both are revisions of papers announced earlier, and together they are ~45% of a typical feed. notStartsWith rather than notEquals because replace-cross exists and an equality test silently lets it through.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Splits the reader profile into wants and don't-wants, then packs every\n * concept and every abstract into one batch embedding request.\n *\n * Why the split: embeddings do not represent negation. \"Not interested in\n * reinforcement learning for games\" embeds close to \"interested in\n * reinforcement learning for games\" — the content words dominate and \"not\" is\n * a rounding error. Fold the whole profile into one vector and it faithfully\n * attracts everything the reader asked to avoid. So the halves are embedded\n * separately and the negative one is subtracted downstream.\n *\n * Classification is per fragment, not per line: \"Ships production systems;\n * does not run large-scale pretraining\" is a want and a don't-want in one\n * sentence, and the don't-want is the half that matters.\n */\nconst cfg = $('Config').first().json;\nconst papers = $input.all().map((i) => i.json);\n\nconst NEGATIVE_MARKERS = ['not interested', 'no interest', 'not relevant', 'uninterested', 'avoid', 'exclude', 'ignore'];\nconst POSITIVE_MARKERS = ['interested in', 'actively working', 'working on', 'focus', 'care about', 'looking for'];\nconst INLINE_NEGATIONS = ['does not', 'do not', \"doesn't\", \"don't\", 'rather than', 'instead of'];\n\n// Left behind once a marker is stripped: \"Not interested in: X\" -> \" in: X\".\nconst LEADING_CONNECTOR = /^\\s*(?:in|on|about|with|to|for|by)?\\s*:?\\s*/i;\nconst MARKER_RE = new RegExp('^.*(?:' + [...NEGATIVE_MARKERS, ...POSITIVE_MARKERS].join('|') + ')', 'i');\n\n// One vector for \"RAG, agents, evaluation\" is a blurred average that matches\n// none of them well. Three vectors, scored with a max, match each precisely.\nconst fragments = (text) =>\n  String(text)\n    .split(/[,;.\\n]| and (?=[a-z])/)\n    .map((p) => p.replace(/^[\\s\\t\\-–—:()]+|[\\s\\t\\-–—:()]+$/g, ''))\n    // A letter has to be present, and 3 chars is the floor: \"rag\" and \"agents\"\n    // are real entries in the vocabulary, and a longer minimum would silently\n    // drop the reader's most important interests while appearing to work.\n    .filter((p) => p.length >= 3 && /[a-z]/i.test(p));\n\nconst positive = [];\nconst negative = [];\nlet lineMode = positive;\n\nfor (const rawLine of String(cfg.research_profile ?? '').split('\\n')) {\n  const line = rawLine.trim();\n  if (!line) continue;\n\n  const lower = line.toLowerCase();\n  // A heading sets the mode for this line and the ones that continue it, so a\n  // wrapped \"Not interested in:\" list stays negative to its last item.\n  if (NEGATIVE_MARKERS.some((m) => lower.includes(m))) lineMode = negative;\n  else if (POSITIVE_MARKERS.some((m) => lower.includes(m))) lineMode = positive;\n\n  const stripped = line.replace(MARKER_RE, '');\n  const body = stripped !== line ? stripped.replace(LEADING_CONNECTOR, '') : line;\n\n  for (const fragment of fragments(body || line)) {\n    const inlineNegative = INLINE_NEGATIONS.some((neg) => fragment.toLowerCase().includes(neg));\n    (inlineNegative ? negative : lineMode).push(fragment);\n  }\n}\n\nconst uniq = (xs) => [...new Set(xs)];\nconst pos = uniq(positive);\nconst neg = uniq(negative);\n\nif (pos.length === 0 && neg.length === 0) {\n  throw new Error('research_profile produced no usable concepts - check the Config node');\n}\n\n// batchEmbedContents takes at most 100 texts. Concepts come first because\n// without them nothing can be scored at all; papers take whatever is left and\n// any overflow keeps its chronological place further down.\nconst BATCH_LIMIT = 100;\nconst budget = Math.max(0, BATCH_LIMIT - pos.length - neg.length);\nconst embedded = papers.slice(0, budget);\n\n// The title is repeated: it is the densest signal in the document, and a\n// truncated abstract loses its tail first.\nconst paperText = (p) => `${String(p.title ?? '').trim()}\\n\\n${String(p.title ?? '').trim()}. ${String(p.abstract ?? '').trim()}`;\n\nconst texts = [...pos, ...neg, ...embedded.map(paperText)];\nconst model = 'models/' + String(cfg.embedding_model ?? 'text-embedding-004');\n\nreturn [\n  {\n    json: {\n      positive: pos,\n      negative: neg,\n      counts: { positive: pos.length, negative: neg.length, papers: embedded.length, skipped: papers.length - embedded.length },\n      embedded_ids: embedded.map((p) => p.arxiv_id),\n      payload: JSON.stringify({\n        requests: texts.map((text) => ({ model, content: { parts: [{ text }] } })),\n      }),\n    },\n  },\n];\n"
+      },
+      "id": "rank-split",
+      "name": "Split Profile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        350
+      ],
+      "notes": "Wants and dont-wants are embedded separately because embeddings cannot represent negation.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.embedding_model }}:batchEmbedContents",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.payload }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "rank-embed",
+      "name": "Embed with Gemini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        350
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini - AI Paper Digest"
+        }
+      },
+      "notes": "One batch call for every concept and every abstract. Free tier, same key as the chat model. On failure the run continues on chronological order.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Scores every paper against the profile and orders them, best first.\n *\n *   score = max cosine(paper, any positive concept)\n *         - w * max cosine(paper, any negative concept)\n *\n * Max rather than mean on both sides: a paper is relevant because it matches\n * one interest strongly, not because it is vaguely near the average of all of\n * them. The same logic makes a single strong hit against a negative concept\n * enough to sink it.\n *\n * This stage is an optimisation, not a dependency. If the embedding call\n * failed, was throttled, or answered with something unexpected, the papers\n * come back in the feed's own chronological order and the run continues. A\n * digest of the five newest is worse than a digest of the five best, and far\n * better than the silence of a failed run.\n */\nconst cfg = $('Config').first().json;\nconst papers = $('New and Cross-Lists Only').all().map((i) => i.json);\nconst meta = $('Split Profile').first().json;\n\nconst byRecency = (why) => papers.map((p) => ({ json: { ...p, ranked_by: why, rank_score: null } }));\n\nconst response = $input.first()?.json ?? {};\nconst vectors = Array.isArray(response.embeddings)\n  ? response.embeddings.map((e) => e?.values).filter(Array.isArray)\n  : null;\n\nconst expected = meta.counts.positive + meta.counts.negative + meta.counts.papers;\nif (!vectors || vectors.length !== expected) {\n  // A short or malformed response cannot be sliced safely - the concept and\n  // paper vectors would be misaligned and every score silently wrong, which is\n  // worse than not ranking at all.\n  return byRecency('recency');\n}\n\nconst norm = (v) => {\n  let sum = 0;\n  for (const x of v) sum += x * x;\n  const n = Math.sqrt(sum);\n  return n ? v.map((x) => x / n) : v;\n};\nconst dot = (a, b) => {\n  let s = 0;\n  for (let i = 0; i < a.length; i++) s += a[i] * b[i];\n  return s;\n};\n\nconst nPos = meta.counts.positive;\nconst nNeg = meta.counts.negative;\n\nconst posVecs = vectors.slice(0, nPos).map(norm);\nconst negVecs = vectors.slice(nPos, nPos + nNeg).map(norm);\nconst paperVecs = vectors.slice(nPos + nNeg).map(norm);\n\nconst weight = Number(cfg.ranker_negative_weight ?? 0.5);\n\nconst scores = new Map();\nmeta.embedded_ids.forEach((arxivId, i) => {\n  const v = paperVecs[i];\n\n  let bestPos = 0;\n  let matched = '';\n  for (let j = 0; j < posVecs.length; j++) {\n    const s = dot(v, posVecs[j]);\n    if (s > bestPos || matched === '') {\n      bestPos = s;\n      matched = meta.positive[j];\n    }\n  }\n\n  let bestNeg = 0;\n  for (const nv of negVecs) bestNeg = Math.max(bestNeg, dot(v, nv));\n\n  scores.set(arxivId, {\n    score: Number((bestPos - weight * bestNeg).toFixed(6)),\n    positive_similarity: Number(bestPos.toFixed(6)),\n    negative_similarity: Number(bestNeg.toFixed(6)),\n    matched,\n  });\n});\n\nconst ranked = papers.map((p) => {\n  const hit = scores.get(p.arxiv_id);\n  return {\n    json: {\n      ...p,\n      rank_score: hit ? hit.score : null,\n      rank_matched: hit ? hit.matched : '',\n      rank_positive: hit ? hit.positive_similarity : null,\n      rank_negative: hit ? hit.negative_similarity : null,\n      ranked_by: hit ? 'embedding' : 'recency',\n    },\n  };\n});\n\n// Papers that overflowed the batch limit keep their place at the back rather\n// than being dropped: a partial ranking must not silently lose papers.\nranked.sort((a, b) => (b.json.rank_score ?? -Infinity) - (a.json.rank_score ?? -Infinity));\n\nreturn ranked;\n"
+      },
+      "id": "rank-score",
+      "name": "Rank by Similarity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        350
+      ]
+    },
+    {
+      "parameters": {
+        "maxItems": "={{ $('Config').first().json.max_papers_per_run }}",
+        "keep": "firstItems"
+      },
+      "id": "cap",
+      "name": "Cap Papers Per Run",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        350
+      ],
+      "notes": "Placed BEFORE the deduplicator on purpose: papers past the cap are never marked seen, so raising the cap later does not leave a permanent hole.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "removeItemsSeenInPreviousExecutions",
+        "logic": "removeItemsWithAlreadySeenKeyValues",
+        "dedupeValue": "={{ $json.arxiv_id }}",
+        "options": {
+          "historySize": 10000
+        }
+      },
+      "id": "dedupe",
+      "name": "Unseen Papers Only",
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        350
+      ],
+      "notes": "Keyed on arXiv ID, persisted across executions.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "loop",
+      "name": "Loop Over Papers",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2280,
+        350
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.llm_throttle_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "throttle",
+      "name": "Throttle (free tier)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        520
+      ],
+      "notes": "Paces the loop under the Gemini free-tier requests-per-minute cap.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Title: {{ $json.title }}\narXiv ID: {{ $json.arxiv_id }}\nPrimary category: {{ $json.primary_category }}\nAll categories: {{ $json.categories.join(', ') }}\nAuthors: {{ $json.authors_line }}\nSubmitted: {{ $json.published }}\nAuthor comment: {{ $json.comment || '—' }}\n\nAbstract:\n\"\"\"\n{{ $json.abstract }}\n\"\"\"",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "=You are a research analyst who triages the daily arXiv firehose for one specific reader. You see one paper at a time and you only ever see its abstract — never the full text.\n\nREADER PROFILE\n{{ $('Config').first().json.research_profile }}\n\nCONTROLLED VOCABULARY (prefer these tags, in this exact spelling)\n{{ $('Config').first().json.topic_vocabulary }}\n\nHOW TO SCORE\nrelevance_score is about *this reader*, not about the paper's importance to the field.\n  9-10  Directly actionable for the reader's current work. They would open the PDF today.\n  7-8   Clearly inside their interests; worth a read this week.\n  5-6   Adjacent. Useful context, no urgency.\n  3-4   Same broad field, wrong sub-area.\n  0-2   Unrelated, or a marginal increment on a topic they do not track.\nDo not inflate. A normal day should produce a handful of papers at 7+, not twenty.\n\nHARD RULES\n- Ground every claim in the abstract. If a number, dataset or baseline is not stated there, do not state it.\n- When the abstract makes no empirical claim, write \"Not stated in the abstract.\" rather than guessing.\n- Do not praise the paper. No \"novel\", \"groundbreaking\", \"significant advance\" unless the abstract's own numbers justify it, and then cite the number instead of the adjective.\n- Assume the reader knows ML fundamentals. Never define transformer, attention, fine-tuning, RAG, etc.\n- topics: 2 to 5 tags, lowercase, hyphenated. Reuse the controlled vocabulary; invent at most one new tag, and only when nothing in the list fits.\n- relevance_score is a whole number from 0 to 10. Not a string, not \"8/10\", not 8.5.\n- paper_type is exactly one of: method, benchmark, dataset, theory, survey, application, position.\n- reading_priority is exactly one of: read-now, read-this-week, skim, archive.\n- key_contributions holds 1 to 4 entries. Every field is required; when you have nothing to say, write \"Not stated in the abstract.\" rather than omitting the key or returning null.\n- Return one JSON object and nothing else. No markdown code fences, no commentary before or after it.\n- Write in {{ $('Config').first().json.digest_language }}."
+            }
+          ]
+        }
+      },
+      "id": "llm-chain",
+      "name": "Analyse Paper",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        2620,
+        520
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "notes": "Three tries, 5s apart - n8n caps retry spacing at 5s, so the real defence against a 429 is the Throttle node in front, not this. After the retries the paper is skipped rather than failing the whole run."
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "temperature": 0.2,
+          "maxOutputTokens": 8192
+        }
+      },
+      "id": "llm-model",
+      "name": "Gemini 2.5 Flash",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2580,
+        760
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini - AI Paper Digest"
+        }
+      },
+      "notes": "8192 output tokens. 2.5 Flash is a thinking model and its reasoning is billed against this same budget - a limit sized for the visible answer alone gets spent on thinking and truncates the JSON mid-string."
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"relevance_score\": {\n      \"type\": \"number\",\n      \"description\": \"Whole number from 0 to 10. How relevant this paper is to the reader profile.\"\n    },\n    \"relevance_reason\": {\n      \"type\": \"string\",\n      \"description\": \"One sentence, max 25 words, justifying the score against the reader profile.\"\n    },\n    \"tldr\": {\n      \"type\": \"string\",\n      \"description\": \"One sentence, max 30 words. What the paper does. No hype.\"\n    },\n    \"why_it_matters\": {\n      \"type\": \"string\",\n      \"description\": \"Two sentences at most, addressed to the reader profile. What changes if this holds up.\"\n    },\n    \"key_contributions\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"Between 1 and 4 concrete claims from the abstract, one per entry.\"\n    },\n    \"method\": {\n      \"type\": \"string\",\n      \"description\": \"The approach in 1-2 sentences. Name the architecture, objective or dataset if the abstract does.\"\n    },\n    \"results\": {\n      \"type\": \"string\",\n      \"description\": \"Headline numbers exactly as stated, with the baseline they beat. \\\"Not stated in the abstract.\\\" if absent.\"\n    },\n    \"limitations\": {\n      \"type\": \"string\",\n      \"description\": \"Caveats the abstract admits, or that are obvious from scope (single language, toy scale, no ablation).\"\n    },\n    \"topics\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"Between 2 and 5 lowercase hyphenated tags, from the controlled vocabulary where possible.\"\n    },\n    \"paper_type\": {\n      \"type\": \"string\",\n      \"description\": \"Exactly one of: method, benchmark, dataset, theory, survey, application, position.\"\n    },\n    \"reading_priority\": {\n      \"type\": \"string\",\n      \"description\": \"Exactly one of: read-now, read-this-week, skim, archive.\"\n    }\n  },\n  \"required\": [\n    \"relevance_score\",\n    \"relevance_reason\",\n    \"tldr\",\n    \"why_it_matters\",\n    \"key_contributions\",\n    \"method\",\n    \"results\",\n    \"limitations\",\n    \"topics\",\n    \"paper_type\",\n    \"reading_priority\"\n  ]\n}"
+      },
+      "id": "parser",
+      "name": "Analysis Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        2780,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "/**\n * Re-attaches the paper metadata to the model's structured output, and is\n * where every value constraint is actually enforced.\n *\n * The JSON schema on the parser deliberately carries types only. Gemini\n * supports a subset of JSON Schema and quietly ignores minItems, maximum,\n * enum and additionalProperties - but the parser still validates against\n * them on the way back, so a strict schema fails a response the model was\n * never told to constrain. Ranges belong in the prompt; enforcement belongs\n * here, where it is deterministic and survives swapping the provider.\n */\nconst paper = $('Loop Over Papers').item.json;\nconst analysis = $json.output ?? $json;\n\nconst slug = (t) =>\n  String(t)\n    .toLowerCase()\n    .trim()\n    .replace(/[^a-z0-9]+/g, '-')\n    .replace(/^-+|-+$/g, '');\n\n// Tags: slugged, deduped, capped. Across runs the same concept comes back as\n// \"RAG\", \"rag \" and \"Rag\", which makes the tag line useless for searching.\nconst topics = [...new Set((analysis.topics ?? []).map(slug).filter(Boolean))].slice(0, 5);\n\n// Score: a model returns 11, 8.5 or \"8/10\" often enough to matter, and\n// Number(\"8/10\") is NaN - which would quietly score a relevant paper 0 and\n// drop it from the digest. Pull the first number out of whatever arrived.\nconst firstNumber = (v) => {\n  if (typeof v === 'number') return v;\n  const m = String(v ?? '').match(/-?\\d+(?:\\.\\d+)?/);\n  return m ? Number(m[0]) : NaN;\n};\n\nconst rawScore = firstNumber(analysis.relevance_score);\nconst score = Number.isFinite(rawScore) ? Math.max(0, Math.min(10, Math.round(rawScore))) : 0;\n\n// Enumerations: snap to the allowed set rather than trusting the model, and\n// fall back to the least assertive option instead of failing the paper.\nconst pick = (value, allowed, fallback) => {\n  const v = slug(value);\n  return allowed.includes(v) ? v : fallback;\n};\n\nconst paperType = pick(\n  analysis.paper_type,\n  ['method', 'benchmark', 'dataset', 'theory', 'survey', 'application', 'position'],\n  'method',\n);\n\nconst priority = pick(\n  analysis.reading_priority,\n  ['read-now', 'read-this-week', 'skim', 'archive'],\n  'skim',\n);\n\n// Contributions: an array most of the time, occasionally one newline-joined\n// string. Both are cheap to accept.\nconst rawContributions = analysis.key_contributions;\nconst contributions = (\n  Array.isArray(rawContributions) ? rawContributions : String(rawContributions ?? '').split('\\n')\n)\n  .map((c) => String(c).replace(/^[-*\\u2022]\\s*/, '').trim())\n  .filter(Boolean)\n  .slice(0, 4);\n\nconst text = (v) => {\n  const t = String(v ?? '').trim();\n  return t || 'Not stated in the abstract.';\n};\n\nreturn {\n  json: {\n    ...paper,\n    ...analysis,\n    topics,\n    relevance_score: score,\n    relevance_reason: text(analysis.relevance_reason),\n    tldr: text(analysis.tldr),\n    why_it_matters: text(analysis.why_it_matters),\n    method: text(analysis.method),\n    results: text(analysis.results),\n    limitations: text(analysis.limitations),\n    paper_type: paperType,\n    reading_priority: priority,\n    key_contributions: contributions,\n    contributions_text: contributions.map((c) => '- ' + c).join('\\n'),\n    analysed_at: new Date().toISOString(),\n  },\n};"
+      },
+      "id": "merge",
+      "name": "Merge Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "threshold",
+              "leftValue": "={{ $json.relevance_score }}",
+              "rightValue": "={{ $('Config').first().json.relevance_threshold }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate",
+      "name": "Relevant Enough?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3060,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "/**\n * Builds the Discord embed for one paper.\n *\n * Discord rejects the entire message with a 400 if any single limit is\n * exceeded, and a webhook gives you no useful error body to debug it with, so\n * every cap is enforced here rather than hoped for: title 256, description\n * 4096, field value 1024, 25 fields, and 6000 characters across the whole\n * embed counted together.\n */\nconst p = $json;\n\nconst CAP = { title: 256, description: 4096, field: 1024, fields: 25, total: 6000 };\n\nconst cut = (s, n) => {\n  const t = String(s ?? '').trim();\n  return t.length <= n ? t : t.slice(0, n - 1).trimEnd() + '\\u2026';\n};\n\n// The stripe colour carries the score before anyone reads the number.\nconst colour =\n  p.relevance_score >= 9 ? 0xd94f4f :\n  p.relevance_score >= 8 ? 0xe0913e :\n  p.relevance_score >= 7 ? 0x3f7fd9 :\n  0x6b7280;\n\nconst field = (name, value, inline = false) => {\n  const v = String(value ?? '').trim();\n  return v ? { name, value: cut(v, CAP.field), inline } : null;\n};\n\nconst embed = {\n  title: cut(p.title, CAP.title),\n  url: p.abs_url,\n  description: cut(p.tldr + '\\n\\n_' + p.why_it_matters + '_', CAP.description),\n  color: colour,\n  timestamp: p.published,\n  author: { name: cut(p.authors_line, CAP.title) },\n  footer: {\n    text: p.arxiv_id + ' ' + p.version + ' \\u00b7 ' + p.primary_category + ' \\u00b7 scored ' + p.relevance_score + '/10',\n  },\n  fields: [\n    field('Key contributions', p.contributions_text),\n    field('Method', p.method),\n    field('Results', p.results),\n    field('Limitations', p.limitations),\n    field('Type', p.paper_type, true),\n    field('Priority', p.reading_priority, true),\n    field('Categories', (p.categories ?? []).join(', '), true),\n    field('Links', '[abstract](' + p.abs_url + ')  \\u00b7  [pdf](' + p.pdf_url + ')'),\n  ]\n    .filter(Boolean)\n    .slice(0, CAP.fields),\n};\n\n// The 6000 budget is measured across title, description, author, footer and\n// every field name and value together - not per field. Halve the longest\n// field until it fits rather than dropping fields, which would lose sections.\nconst weight = (e) =>\n  (e.title?.length ?? 0) +\n  (e.description?.length ?? 0) +\n  (e.author?.name?.length ?? 0) +\n  (e.footer?.text?.length ?? 0) +\n  e.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);\n\nwhile (weight(embed) > CAP.total) {\n  const longest = embed.fields.reduce((a, b) => (a.value.length >= b.value.length ? a : b));\n  if (longest.value.length <= 200) break;\n  longest.value = cut(longest.value, Math.floor(longest.value.length / 2));\n}\n\n// Tags ride in the message content rather than the embed: that is the part\n// Discord shows in the channel preview and in notifications.\nconst content = (p.topics ?? []).map((t) => '\\u0060' + t + '\\u0060').join(' ');\n\n// allowed_mentions is not optional politeness. A paper whose title or\n// abstract contains @everyone would otherwise ping the entire server, and\n// arXiv titles are not a trusted input.\nconst payload = {\n  content,\n  embeds: [embed],\n  allowed_mentions: { parse: [] },\n};\n\nreturn {\n  json: {\n    ...p,\n    discord_content: content,\n    embed_json: JSON.stringify(embed),\n    embed_weight: weight(embed),\n    discord_payload: JSON.stringify(payload),\n  },\n};"
+      },
+      "id": "embed",
+      "name": "Build Paper Embed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3220,
+        420
+      ],
+      "notes": "Enforces every Discord embed limit before the request is made.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.discord_webhook_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.discord_payload }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "discord",
+      "name": "Discord - Post Paper Card",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3440,
+        420
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "A Discord webhook is a plain POST with a JSON body - no auth header, no SDK. The payload is built in the previous node because the Discord node's embed UI is a fixed collection and cannot express a variable number of fields."
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * The Discord node's response replaces the item, so the paper has to be put\n * back before it returns to the loop and, from there, into the digest.\n *\n * Batch size is 1, so .first() is exact rather than a heuristic - this node\n * stops being correct the moment someone raises that batch size.\n */\nconst paper = $('Merge Analysis').first().json;\n\nreturn [\n  {\n    json: {\n      ...paper,\n      posted_to_discord: true,\n    },\n  },\n];"
+      },
+      "id": "collect",
+      "name": "Collect Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3660,
+        420
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "skipped",
+      "name": "Skipped",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3220,
+        660
+      ],
+      "notes": "Low score, or analysis failed. Either way the iteration has to close or the loop stalls.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Renders the Telegram message.\n *\n * Fed straight from the loop's \"done\" output, which carries every paper the\n * run touched — kept and skipped alike. Selecting, ranking and capping all\n * happen here rather than in a Filter → Sort → Limit chain, for one reason:\n * on a day when nothing clears the threshold there must still be *something*\n * to render, because n8n does not execute a node with zero input items and\n * the digest would silently never be sent. A Filter cannot express that, and\n * a Filter with alwaysOutputData emits an empty item that the Sort node then\n * rejects with \"Couldn't find the field 'relevance_score'\". Doing it in code\n * removes the whole class of problem: an empty list is just an empty list.\n *\n * Telegram rejects any message over 4096 characters, so the digest is emitted\n * as one item per chunk and packed on paper boundaries — an entry is never cut\n * in half, which would also break the HTML tags around it.\n */\nconst CHUNK_LIMIT = 3500;\n\nconst cfg = $('Config').first().json;\nconst screened = $('Unseen Papers Only').all().length;\nconst threshold = Number(cfg.relevance_threshold);\n\n// Papers whose analysis failed arrive as n8n error objects with no arxiv_id\n// and no score. The upstream branch cannot filter them on a score they do not\n// have, so they are dropped here.\nconst papers = $input\n  .all()\n  .map((i) => i.json)\n  .filter((p) => p && p.arxiv_id && Number.isFinite(Number(p.relevance_score)))\n  .filter((p) => Number(p.relevance_score) >= threshold)\n  .sort((a, b) => Number(b.relevance_score) - Number(a.relevance_score))\n  .slice(0, Number(cfg.digest_size));\n\n// Telegram's HTML parse mode is strict: one unescaped \"<\" in a paper title\n// returns a 400 and the whole digest is lost.\nconst esc = (s) =>\n  String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\n// Fields are clipped before the entry is assembled, never after: truncating\n// the finished string would cut an HTML tag in half. The caps only bite when\n// a model ignores the \"max 30 words\" instruction, but a run-on tldr must not\n// be able to push a single entry past what the chunker can place.\nconst clip = (s, n) => {\n  const t = String(s ?? '').trim();\n  return t.length <= n ? t : t.slice(0, n - 1).trimEnd() + '…';\n};\n\nconst header = [\n  '<b>' + $now.toFormat('cccc d LLL') + ' - AI Paper Digest</b>',\n  '<i>' + papers.length + ' of ' + screened + ' new papers scored ' + threshold + '+ - full cards in Discord</i>',\n].join('\\n');\n\nif (papers.length === 0) {\n  return [{ json: { text: header + '\\n\\nNothing cleared the bar today.', chunk: 1, chunks: 1 } }];\n}\n\nconst entries = papers.map((p, i) => {\n  const tags = (p.topics ?? []).map((t) => '#' + t.replace(/-/g, '_')).join(' ');\n  const links = [\n    '<a href=\"' + p.abs_url + '\">abs</a>',\n    '<a href=\"' + p.pdf_url + '\">pdf</a>',\n  ];\n\n  return [\n    '<b>' + (i + 1) + '. ' + esc(clip(p.title, 180)) + '</b>  <code>' + p.relevance_score + '/10</code>',\n    esc(clip(p.tldr, 240)),\n    '<i>' + esc(clip(p.why_it_matters, 340)) + '</i>',\n    (tags ? tags + '\\n' : '') + links.join(' - ') + '  <code>' + esc(p.arxiv_id) + '</code>',\n  ].join('\\n');\n});\n\nconst chunks = [];\nlet current = header;\nfor (const entry of entries) {\n  if (current.length + entry.length + 2 > CHUNK_LIMIT) {\n    chunks.push(current);\n    current = entry;\n  } else {\n    current += '\\n\\n' + entry;\n  }\n}\nchunks.push(current);\n\nreturn chunks.map((text, i) => ({\n  json: {\n    text: chunks.length > 1 ? text + '\\n\\n<i>part ' + (i + 1) + '/' + chunks.length + '</i>' : text,\n    chunk: i + 1,\n    chunks: chunks.length,\n  },\n}));\n"
+      },
+      "id": "digest",
+      "name": "Build Telegram Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        60
+      ],
+      "notes": "Selects, ranks and caps in code. A Filter/Sort/Limit chain cannot render a quiet day: n8n skips a node with no input items, so the digest would never be sent.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "telegram",
+      "name": "Send Telegram Digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2880,
+        60
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Telegram - Digest Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule 16:30 (Mon-Fri)": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Build arXiv Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build arXiv Query": {
+      "main": [
+        [
+          {
+            "node": "Fetch arXiv Feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch arXiv Feed": {
+      "main": [
+        [
+          {
+            "node": "Parse Atom Feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Atom Feed": {
+      "main": [
+        [
+          {
+            "node": "Normalise Papers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Papers": {
+      "main": [
+        [
+          {
+            "node": "New and Cross-Lists Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New and Cross-Lists Only": {
+      "main": [
+        [
+          {
+            "node": "Split Profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Profile": {
+      "main": [
+        [
+          {
+            "node": "Embed with Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed with Gemini": {
+      "main": [
+        [
+          {
+            "node": "Rank by Similarity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank by Similarity": {
+      "main": [
+        [
+          {
+            "node": "Cap Papers Per Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cap Papers Per Run": {
+      "main": [
+        [
+          {
+            "node": "Unseen Papers Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unseen Papers Only": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Papers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Papers": {
+      "main": [
+        [
+          {
+            "node": "Build Telegram Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Throttle (free tier)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle (free tier)": {
+      "main": [
+        [
+          {
+            "node": "Analyse Paper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini 2.5 Flash": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Analyse Paper",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analysis Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Analyse Paper",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse Paper": {
+      "main": [
+        [
+          {
+            "node": "Merge Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Analysis": {
+      "main": [
+        [
+          {
+            "node": "Relevant Enough?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relevant Enough?": {
+      "main": [
+        [
+          {
+            "node": "Build Paper Embed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Paper Embed": {
+      "main": [
+        [
+          {
+            "node": "Discord - Post Paper Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord - Post Paper Card": {
+      "main": [
+        [
+          {
+            "node": "Collect Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Result": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Papers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skipped": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Papers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Telegram Digest": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Lisbon",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "executionTimeout": 1800,
+    "errorWorkflow": "REPLACE_WITH_ERROR_HANDLER_WORKFLOW_ID"
+  },
+  "pinData": {}
+}

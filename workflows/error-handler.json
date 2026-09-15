@@ -1,0 +1,100 @@
+{
+  "name": "AI Paper Digest - Error Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Error handler\n\nSet as the **Error Workflow** of *AI Paper Digest* (Workflow settings → Error workflow).\n\nn8n calls it once per failed execution with the failing node, the message and a deep link. A silent scheduled workflow that quietly stopped working is worse than no workflow at all.",
+        "height": 240,
+        "width": 620,
+        "color": 2
+      },
+      "id": "Note - Error",
+      "name": "Note - Error",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -320,
+        -140
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "err-trigger",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -300,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Turns n8n's error payload into something readable on a phone at 07:31.\n */\nconst e = $json.execution ?? {};\nconst w = $json.workflow ?? {};\n\nconst trimmed = String(e.error?.message ?? 'Unknown error').slice(0, 400);\n\nconst text = [\n  '<b>AI Paper Digest failed</b>',\n  '',\n  'Workflow: ' + (w.name ?? 'unknown'),\n  'Node: <code>' + (e.lastNodeExecuted ?? 'unknown') + '</code>',\n  'When: ' + (e.startedAt ?? new Date().toISOString()),\n  '',\n  '<pre>' + trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</pre>',\n  '',\n  e.url ? '<a href=\"' + e.url + '\">Open the execution</a>' : '',\n]\n  .filter(Boolean)\n  .join('\\n');\n\nreturn [{ json: { text } }];"
+      },
+      "id": "err-format",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID || 'PASTE_TELEGRAM_CHAT_ID' }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "err-telegram",
+      "name": "Alert on Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        160
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Telegram - Digest Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Alert on Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Lisbon"
+  },
+  "pinData": {}
+}
