@@ -8,6 +8,11 @@ Two workflows, no custom nodes, no paid services — it runs on free API tiers.
 
 ## The pipeline
 
+![The pipeline: arXiv RSS through embedding rank, Gemini scoring, Discord and Telegram](docs/images/pipeline.png)
+
+<details>
+<summary>Same thing as text</summary>
+
 ```
                     ┌──────────────┐
   cron 16:30  ─────▶│    Config    │   categories · thresholds · reader profile
@@ -36,9 +41,26 @@ Two workflows, no custom nodes, no paid services — it runs on free API tiers.
              rank · top 8 · render HTML ─────────▶  Telegram
 ```
 
+</details>
+
 A typical weekday: ~115 announcements, ~64 survive once revisions are dropped, the top `max_papers_per_run` by relevance go to the model, and whichever clear the threshold reach Discord and the phone. The cap ships at 10 — a free-tier budget expressed in papers rather than in tokens.
 
-Discord is the archive — one colour-coded embed per paper in `#ai-papers`, searchable, permanent. Telegram is the nudge — one ranked message, capped at eight papers, that you read standing up.
+---
+
+## Outputs
+
+### Discord — the archive
+
+![A paper card in Discord: coloured score stripe, TL;DR, method, results and limitations as fields](docs/images/discord-card.png)
+
+One embed per paper in `#ai-papers`, colour-coded by score. Permanent and searchable: the channel *is* the archive.
+
+### Telegram — the nudge
+
+![The daily Telegram digest: papers ranked by score with abstract and PDF links](docs/images/telegram-digest.png)
+
+One ranked message a day, capped at eight papers, short enough to read standing up. It arrives even when nothing clears the threshold — it says `0 of N` — because silence should mean something is broken, never that the day was quiet.
+
 
 ---
 
@@ -115,10 +137,9 @@ docs/
 - n8n **1.62 or newer** — earlier versions do not have the cross-execution mode of `Remove Duplicates`, which the deduplication depends on. Self-hosted or Cloud both work; [docs/setup.md](docs/setup.md#where-to-run-n8n) covers the trade-off, which comes down to whether the machine is awake when the schedule fires
 - A Google AI Studio API key — the free tier is enough (or any other chat model node; see [docs/setup.md](docs/setup.md#swapping-the-model))
 - A Discord webhook URL
-- Nothing else. The ranking stage uses the same Gemini key.
 - A Telegram bot token and your chat ID
 
-No arXiv credentials: the export API is open, and the workflow identifies itself with a `User-Agent` and backs off on failure, as arXiv asks.
+Nothing else. The ranking stage reuses the same Gemini key, and arXiv's RSS feed needs no credentials — the workflow just identifies itself with a `User-Agent`, as arXiv asks.
 
 ## Getting started
 
@@ -147,4 +168,4 @@ If volume ever becomes the problem, raise `relevance_threshold` or narrow `arxiv
 
 ## License
 
-MIT.
+MIT
