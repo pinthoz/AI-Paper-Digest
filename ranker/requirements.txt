@@ -3,8 +3,12 @@ uvicorn[standard]>=0.32
 pydantic>=2.9
 numpy>=1.26
 
-# Embedding model. Only needed if you run this service as the ranker; the n8n
-# workflow uses the Gemini embeddings API instead and does not need any of it.
+# The embedding model — the first ranking stage runs here. This used to be
+# optional, back when the workflow called Gemini's batchEmbedContents instead.
+# That endpoint caps a request at 100 texts and a weekday across five arXiv
+# categories is several hundred, so the pre-filter silently stopped at the
+# ceiling. Ranking moved here, where there is no ceiling to hit, and this
+# dependency stopped being optional with it.
 sentence-transformers>=3.3
 
 # Topic clustering. Imported lazily, so /papers, /similar and /metrics all work

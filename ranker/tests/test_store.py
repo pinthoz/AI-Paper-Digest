@@ -169,11 +169,39 @@ class TestTopicsAndFeedback:
         store.record(paper("2609.0002", topics=["rag"]))
         assert store.topics_since()[0] == ("rag", 2)
 
-    def test_feedback_is_append_only(self, store):
+    def test_two_different_signals_on_one_paper_are_two_reactions(self, store):
         store.record(paper("2609.0001"))
         store.add_feedback("2609.0001", "read", source="discord-reaction")
         store.add_feedback("2609.0001", "archived")
         assert store.count()["feedback"] == 2
+
+    def test_rows_are_append_only(self, store):
+        """Re-reading a card records the tap again, on purpose: the row keeps
+        *when* it was seen, which a deduplicating table would throw away."""
+        store.record(paper("2609.0001"))
+        for _ in range(3):
+            store.add_feedback("2609.0001", "useful", source="discord-reaction")
+        rows = store._conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        assert rows == 3
+
+    def test_the_same_reaction_seen_repeatedly_is_counted_once(self, store):
+        """The sync runs on a schedule and is append-only, so COUNT(*) would
+        report how often it ran rather than how many reactions exist. A
+        fortnight of four-hourly runs would turn one tap into eighty-four."""
+        store.record(paper("2609.0001"))
+        for _ in range(12):
+            store.add_feedback("2609.0001", "useful", source="discord-reaction")
+        assert store.count()["feedback"] == 1
+
+    def test_repeated_syncs_do_not_move_the_summary(self, store):
+        """feedback_summary already counted distinct papers; this pins that the
+        two agree, so the stat tile and the chart cannot tell different stories."""
+        store.record(paper("2609.0001", relevance_score=8))
+        for _ in range(5):
+            store.add_feedback("2609.0001", "useful", source="discord-reaction")
+        summary = store.feedback_summary()
+        assert [r["papers"] for r in summary] == [1]
+        assert store.count()["feedback"] == 1
 
     def test_feedback_requires_a_known_paper(self, store):
         import sqlite3

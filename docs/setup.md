@@ -146,18 +146,27 @@ Restart n8n after adding the variable — it is read at process start.
 
 ## 7. Import
 
-**Workflows → Import from File**, twice:
+**Workflows → Import from File**, three times:
 
 1. `workflows/error-handler.json`
 2. `workflows/ai-paper-digest.json`
+3. `workflows/feedback-sync.json`
 
-Order matters: the error handler has to exist as a saved workflow before the main one can point at it.
+Order matters: the error handler has to exist as a saved workflow before the other two can point at it.
 
-Then wire them together. Open **AI Paper Digest → ⋯ (top right) → Settings → Error Workflow** and pick **AI Paper Digest - Error Handler** from the dropdown. It lists your workflows by name — there is no ID to copy anywhere, and the `REPLACE_WITH_ERROR_HANDLER_WORKFLOW_ID` string in the JSON is only a placeholder for a value n8n assigns on import. Save.
+Then wire them together. Open **AI Paper Digest → ⋯ (top right) → Settings → Error Workflow** and pick **AI Paper Digest - Error Handler** from the dropdown. It lists your workflows by name — there is no ID to copy anywhere, and the `REPLACE_WITH_ERROR_HANDLER_WORKFLOW_ID` string in the JSON is only a placeholder for a value n8n assigns on import. Save. Do the same for **AI Paper Digest - Feedback Sync**.
 
 If the dropdown is empty, the error handler was imported but never saved: open it and hit **Save** once.
 
 Set the timezone in the same panel if you are not in `Europe/Lisbon`. The cron expression `30 17 * * 1-5` is evaluated in the workflow's timezone, not the server's.
+
+### What the third workflow is for
+
+The pipeline posts a card and seeds it with ✅ ❌ 👀. Nothing reads those back on its own — `POST /feedback/sync` has to be called, and **Feedback Sync** is what calls it, every four hours.
+
+Leave it inactive and everything still works; you simply never find out whether the model's scores predict what you actually open, which is the one question the dashboard's *Does it know me?* tab exists to answer. It needs `DISCORD_BOT_TOKEN` set — a bot token, not the webhook, because on Discord writing and reading are separate permissions. Without one the workflow reports `not-configured` and stops, rather than failing.
+
+Activate it with the toggle at the top right, the same as the main workflow. Run it once by hand first (**Run Manually**) and read the `Report` node: it says in one line whether it synced, whether the token is missing, or whether the shared secret does not match.
 
 ---
 

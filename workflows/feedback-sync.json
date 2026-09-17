@@ -1,0 +1,207 @@
+{
+  "name": "AI Paper Digest - Feedback Sync",
+  "nodes": [
+    {
+      "id": "note-sync",
+      "name": "Note - Feedback Sync",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        -60
+      ],
+      "parameters": {
+        "content": "## Feedback sync\n\nThe pipeline posts a card and seeds it with the three reactions. Nothing\nread them back until this existed: `POST /feedback/sync` was implemented,\ntested and reachable, and no schedule ever called it — so the loop the\nREADME describes was, in practice, switched off.\n\n**Why a separate workflow.** The digest runs once a weekday at 17:30.\nReactions arrive over the days that follow, on cards from the whole\nfortnight. Tying the read to the write would only ever catch the taps that\nlanded in the same second the card was posted.\n\n**Why four-hourly.** Reactions are not urgent and the endpoint re-reads a\nfourteen-day window each time, so this is a trade between freshness and\nDiscord's rate limit, not a race. Six runs a day is already far more than\nthe data changes.\n\n**It records the same reaction repeatedly, and that is deliberate.** The\nfeedback table is append-only, so a row is an observation, not a state —\nwhich leaves the door open to asking *when* a tap arrived. Both the stat\ntile and the summary count distinct `(paper, signal)` pairs, so the\nrepetition never reaches a number anyone reads.\n\n**Needs a bot token, not the webhook.** On Discord writing and reading are\nseparate permissions. The service returns **501** if `DISCORD_BOT_TOKEN`\nis unset — a clear \"not configured\", not a failure, which is why this\nworkflow treats a non-2xx as information rather than an outage.",
+        "height": 620,
+        "width": 460,
+        "color": 4
+      }
+    },
+    {
+      "id": "trg-sync",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        160,
+        200
+      ],
+      "notes": "Reactions arrive over days, not seconds. Nothing here is urgent.",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "15 */4 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "trg-manual-sync",
+      "name": "Run Manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        160,
+        380
+      ],
+      "notes": "For checking the bot token and channel permissions without waiting.",
+      "parameters": {}
+    },
+    {
+      "id": "sync-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        400,
+        280
+      ],
+      "notes": "Same two variables the main workflow reads. Empty store_url disables the sync.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "store_url",
+              "name": "store_url",
+              "value": "={{ $env.STORE_URL || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "ranker_token",
+              "name": "ranker_token",
+              "value": "={{ $env.RANKER_TOKEN || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "lookback_days",
+              "name": "lookback_days",
+              "value": 14,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "sync-http",
+      "name": "Sync Reactions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "Continues on error: a missing bot token is a 501, which is a configuration answer rather than a failure.",
+      "notesInFlow": true,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.store_url.replace(/\\/+$/, '') + '/feedback/sync' }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "days",
+              "value": "={{ $json.lookback_days }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Ranker-Token",
+              "value": "={{ $json.ranker_token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sync-report",
+      "name": "Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        280
+      ],
+      "parameters": {
+        "jsCode": "/**\n * Turns the service's answer into one readable line in the execution list.\n *\n * The HTTP node never errors, so every outcome arrives here and has to be\n * told apart by status. The three that matter are different things:\n *\n *   501  the bot token is not set - reactions are simply not configured\n *   401  the shared secret does not match between n8n and the service\n *   2xx  it ran; 'signals' is how many reactions were found, which is\n *        legitimately 0 on a day nobody tapped anything\n *\n * Returning a row rather than throwing keeps a missing token out of the\n * error workflow: nothing is broken, a feature is off.\n */\nconst cfg = $('Config').first().json;\n\nif (!cfg.store_url) {\n  return [{ json: { ok: false, state: 'disabled', detail: 'STORE_URL is empty - the store and the sync are both off' } }];\n}\n\nconst res = $input.first().json ?? {};\nconst status = Number(res.statusCode ?? 0);\nconst body = res.body ?? {};\n\nif (status === 501) {\n  return [{ json: { ok: false, state: 'not-configured', detail: 'DISCORD_BOT_TOKEN is unset - reactions need a bot, not the webhook' } }];\n}\nif (status === 401) {\n  return [{ json: { ok: false, state: 'unauthorised', detail: 'RANKER_TOKEN differs between n8n and the ranker' } }];\n}\nif (status < 200 || status >= 300) {\n  return [{ json: { ok: false, state: 'error', status, detail: String(body?.detail ?? 'no detail') } }];\n}\n\n// 'cards_checked', not 'cards' - the endpoint names it for what it did.\nconst cards = Number(body.cards_checked ?? 0);\nconst signals = Number(body.signals ?? 0);\n\nreturn [{\n  json: {\n    ok: true,\n    state: 'synced',\n    cards,\n    signals,\n    detail: signals === 0\n      ? `read ${cards} cards, nobody has reacted yet`\n      : `read ${cards} cards, recorded ${signals} reactions`,\n  },\n}];"
+      }
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Sync Reactions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Reactions": {
+      "main": [
+        [
+          {
+            "node": "Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Lisbon",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 300,
+    "errorWorkflow": "REPLACE_WITH_ERROR_HANDLER_WORKFLOW_ID"
+  },
+  "pinData": {}
+}

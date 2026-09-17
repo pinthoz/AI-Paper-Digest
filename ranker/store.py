@@ -285,7 +285,16 @@ class Store:
             "ranked": one("SELECT COUNT(*) FROM analyses WHERE rank_score IS NOT NULL"),
             "analysed": one("SELECT COUNT(*) FROM analyses WHERE relevance_score IS NOT NULL"),
             "embedded": one("SELECT COUNT(*) FROM embeddings"),
-            "feedback": one("SELECT COUNT(*) FROM feedback"),
+            # Distinct reactions, not rows. The table is append-only on
+            # purpose - re-reading a card records the same tap again, which is
+            # what preserves *when* a reaction arrived - so COUNT(*) answers
+            # "how many times did the sync run" rather than "how many
+            # reactions are there". Once the sync is on a schedule the two
+            # diverge fast: a fortnight of four-hourly runs turns two
+            # reactions into a hundred and sixty-eight.
+            "feedback": one(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT arxiv_id, signal FROM feedback)"
+            ),
         }
 
     def vectors(self) -> tuple[list[str], np.ndarray]:

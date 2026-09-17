@@ -1,8 +1,10 @@
 # AI Paper Digest
 
+[![tests](https://github.com/pinthoz/AI-Paper-Digest/actions/workflows/tests.yml/badge.svg)](https://github.com/pinthoz/AI-Paper-Digest/actions/workflows/tests.yml)
+
 An n8n pipeline that reads the daily arXiv output, scores every new paper against a written description of what I actually work on, posts the survivors as rich cards in Discord, and sends a ranked digest to Telegram before I open my laptop.
 
-Two n8n workflows and a small Python service that remembers what they did. No custom nodes, no paid services — it runs on free API tiers.
+Three n8n workflows and a small Python service that remembers what they did, with a dashboard over the record. No custom nodes, no paid services — it runs on free API tiers.
 
 ---
 
@@ -63,6 +65,26 @@ One embed per paper in `#ai-papers`, colour-coded by score. Permanent and search
 
 One ranked message a day, capped at eight papers, short enough to read standing up. It arrives even when nothing clears the threshold — it says `0 of N` — because silence should mean something is broken, never that the day was quiet.
 
+### The dashboard — is any of this working?
+
+<!-- SCREENSHOT: docs/images/dashboard.png -->
+
+Discord and Telegram answer *what did it find today*. Neither answers *is the thing any good*, and that question needs the whole record rather than one day of it. A Streamlit app over the same SQLite file, six tabs:
+
+| Tab | The question it answers |
+| --- | --- |
+| **Topic map** | What is this feed actually about? UMAP over the embeddings, HDBSCAN for the groups, c-TF-IDF for the labels — the BERTopic recipe, assembled by hand so each step is inspectable. Every theme gets a drawn region and a name, so the grouping does not rest on colour alone. |
+| **How many themes?** | HDBSCAN has no `k`, which is a feature until someone asks how many topics there are. Sweeps `min_cluster_size` against silhouette and noise fraction, and cross-checks with a k-means elbow found by Kneedle geometry rather than by eye. |
+| **Ranker quality** | Does the cheap stage predict the expensive one? Spearman ρ, recall@k and regret between the cosine score and the LLM's. If it says ρ ≈ 0, the pre-filter is decoration and the honest move is to delete it. |
+| **Does it know me?** | The join the store exists for: the score the model gave against the reaction I left. Below twenty scored papers it refuses to show a correlation at all. |
+| **What it feeds me** | Volume per day, the score distribution, and which topics recur — with colour carrying how those papers actually scored, so a long pale bar is a subject the feed is full of and I keep not wanting. |
+| **Papers** | The searchable table, because sometimes the answer is just *find that paper from Tuesday*. |
+
+Every panel withholds its number until the data supports it. A correlation over five points is noise with a decimal place, and rendering it anyway would be the most misleading thing on the page.
+
+```bash
+docker compose up -d dashboard   # http://localhost:8501
+```
 
 ---
 
@@ -139,21 +161,27 @@ Reading those reactions needs a **bot** token rather than the webhook, because o
 ```
 workflows/
   ai-paper-digest.json     the pipeline — import this
+  feedback-sync.json       reads the Discord reactions back, four-hourly
   error-handler.json       failure alerts — import this too
-ranker/                    the memory, and an optional local ranker
+  validate.py              structural check: dangling edges, committed secrets
+ranker/                    the ranking stage, the memory, and the dashboard
   store.py                 SQLite: papers, analyses, embeddings, feedback
+  ranker.py                profile splitting, negation handling, scoring
   clustering.py            UMAP → HDBSCAN → c-TF-IDF topic discovery
   discord.py               reading reactions back off the cards
-  ranker.py                profile splitting, negation handling, scoring
   eval.py                  does the cheap ranker agree with the expensive one?
   app.py                   FastAPI, the whole HTTP surface
-  tests/                   91 tests, no model and no network
-docker-compose.yml         n8n and the service side by side
+  dashboard.py             the six tabs
+  theme.py                 one validated palette, charts and page alike
+  .streamlit/config.toml   the theme is declared, never detected
+  tests/                   131 tests, no model and no network
+docker-compose.yml         n8n, the service and the dashboard side by side
 docs/
   setup.md                 credentials, webhook, first run
   architecture.md          node-by-node walkthrough and data shapes
   discord.md               embed anatomy, limits, webhook vs bot
-.env.example               the two values the workflow reads from the environment
+.github/workflows/         the suite and the workflow check, on every push
+.env.example               the values the workflows read from the environment
 ```
 
 ## Requirements
@@ -174,9 +202,9 @@ cp .env.example .env     # fill in the webhook and chat id
 docker compose up -d --build
 ```
 
-Then import both workflow files under **Workflows → Import from File** and follow [docs/setup.md](docs/setup.md). About ten minutes, most of it spent creating credentials.
+Then import the three workflow files under **Workflows → Import from File** and follow [docs/setup.md](docs/setup.md). About ten minutes, most of it spent creating credentials.
 
-The service is optional. Leave `STORE_URL` empty and the pipeline runs exactly as it did before it existed — it loses the memory, never the digest.
+The service is optional. Leave `STORE_URL` empty and the pipeline still runs — it loses the ranking, the memory and the dashboard, never the digest, and the Telegram header says `⚠ ranked by recency` so you know which one you are reading.
 
 ## Running cost
 
@@ -192,8 +220,8 @@ If volume ever becomes the problem, raise `relevance_threshold` or narrow `arxiv
 
 - **Abstracts only.** The model never sees the full text, and the prompt forbids it from inventing what it cannot see. `Results` will often read *"Not stated in the abstract."* — that is the design working, not a bug.
 - **`published` is the announcement date, not the submission date.** RSS stamps every item in a feed with the same timestamp, so papers cannot be ordered by recency within a day. Nothing downstream needs that ordering — the ranker sorts by relevance — but it is why there is no date-window filter any more.
-- **Discord is still a log, not a database.** You cannot sort a channel by relevance or filter to unread. That was the argument for adding a store rather than fighting Discord — the structured record now lives in SQLite, but nothing renders it; the queries are HTTP endpoints, not a UI.
-- **The feedback loop exists but is unproven.** Reactions are collected and joined to the scores; whether the LLM's judgement actually predicts what I open is a question the data has not answered yet. `GET /metrics` refuses to report on fewer than twenty scored papers rather than showing a correlation computed over five, which would be worse than showing nothing.
+- **Discord is still a log, not a database.** You cannot sort a channel by relevance or filter to unread. That was the argument for adding a store rather than fighting Discord: the structured record lives in SQLite, and the dashboard is what reads it back.
+- **The feedback loop is wired but unproven.** Reactions are collected on a schedule and joined to the scores; whether the LLM's judgement actually predicts what I open is a question the data has not answered yet. Both `GET /metrics` and the dashboard refuse to report on fewer than twenty scored papers rather than showing a correlation computed over five, which would be worse than showing nothing.
 - **Clustering needs volume.** A few hundred papers before the topics mean anything. Below that HDBSCAN correctly reports that it found nothing, which is the right answer and an unsatisfying one.
 - **Abstracts only, still.** The store makes a deeper second pass on the top-scoring paper straightforward — fetch the HTML, re-analyse — but that is not built.
 

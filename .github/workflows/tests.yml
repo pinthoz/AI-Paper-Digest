@@ -1,0 +1,60 @@
+# Two things here are worth checking automatically, and they are different in
+# kind. The Python service has a test suite. The n8n workflows are JSON that no
+# compiler ever reads, so they get a structural check instead - including a
+# guard against committing a live webhook or bot token, which is the one
+# mistake in this repository that a revert cannot undo.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ranker:
+    name: ranker (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Dockerfile pins 3.11; 3.12 is here to catch deprecations early
+        # rather than on the day the base image moves.
+        python: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: ranker/requirements-ci.txt
+
+      - name: Install the test dependencies
+        working-directory: ranker
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+
+      - name: Run the suite
+        working-directory: ranker
+        run: python -m pytest tests -q
+
+  workflows:
+    name: n8n workflows
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate the workflow graphs
+        run: python workflows/validate.py
